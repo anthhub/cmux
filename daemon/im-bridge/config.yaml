@@ -1,0 +1,19 @@
+cmux:
+  socket_path: "" # empty = auto-discover
+
+telegram:
+  enabled: true
+  bot_token: "" # set via TELEGRAM_BOT_TOKEN env var or here
+
+slack:
+  enabled: false
+  bot_token: ""
+  app_token: ""
+
+feishu:
+  enabled: false
+  app_id: ""
+  app_secret: ""
+
+security:
+  allowed_users: [] # empty = allow all; add user IDs to restrict
