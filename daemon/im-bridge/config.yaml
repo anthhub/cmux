@@ -1,6 +1,16 @@
 cmux:
   socket_path: "" # empty = auto-discover
 
+ai:
+  default_agent: "claude" # claude | codex | shell
+  workdir: "" # empty = current repo
+  claude_path: "claude"
+  claude_model: ""
+  claude_permission_mode: "default"
+  codex_path: "codex"
+  codex_model: ""
+  codex_sandbox: "workspace-write"
+
 telegram:
   enabled: true
   bot_token: "" # set via TELEGRAM_BOT_TOKEN env var or here

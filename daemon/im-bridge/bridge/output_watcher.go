@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"context"
 	"log"
 	"strings"
 	"time"
@@ -13,7 +14,6 @@ const (
 	fastInterval = 500 * time.Millisecond
 	slowInterval = 2 * time.Second
 	idleInterval = 5 * time.Second
-	maxMsgLen    = 4000 // Telegram limit is 4096, leave room for formatting
 )
 
 // watchOutput polls a terminal surface for output changes and streams diffs to IM.
@@ -21,7 +21,7 @@ const (
 // - Captures baseline BEFORE command, only sends genuinely NEW content
 // - Debounces rapid changes (waits for output to stabilize)
 // - Strips ANSI codes, cleans up terminal noise
-func (sm *SessionManager) watchOutput(agent *Agent, session *Session, channelName, chatID string) {
+func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, session *Session, channelName, chatID string) {
 	log.Printf("[watcher] starting for session %s (surface %s)", session.Name, session.SurfaceID)
 
 	ticker := time.NewTicker(fastInterval)
@@ -36,13 +36,16 @@ func (sm *SessionManager) watchOutput(agent *Agent, session *Session, channelNam
 
 	for {
 		select {
+		case <-ctx.Done():
+			log.Printf("[watcher] context cancelled for session %s", session.Name)
+			return
 		case <-ticker.C:
-			if !session.Watching {
+			if !session.isWatching() {
 				log.Printf("[watcher] stopped for session %s", session.Name)
 				return
 			}
 
-			currentOutput, err := sm.cmux.ReadText(session.SurfaceID)
+			currentOutput, err := sm.cmux.ReadText(workspaceID, session.SurfaceID)
 			if err != nil {
 				idleCount++
 				continue
@@ -50,7 +53,7 @@ func (sm *SessionManager) watchOutput(agent *Agent, session *Session, channelNam
 
 			// Normalize for comparison — strip ANSI first to avoid false diffs from cursor/color changes
 			currentCleaned := cleanTerminalOutput(currentOutput)
-			lastCleaned := cleanTerminalOutput(session.LastOutput)
+			lastCleaned := cleanTerminalOutput(session.lastOutput())
 
 			if currentCleaned == lastCleaned || currentCleaned == "" {
 				idleCount++
@@ -64,7 +67,7 @@ func (sm *SessionManager) watchOutput(agent *Agent, session *Session, channelNam
 
 			// Genuine new content detected
 			diff := extractNewLines(lastCleaned, currentCleaned)
-			session.LastOutput = currentOutput
+			session.setLastOutput(currentOutput)
 			idleCount = 0
 			ticker.Reset(fastInterval)
 
@@ -75,7 +78,7 @@ func (sm *SessionManager) watchOutput(agent *Agent, session *Session, channelNam
 
 			// Accumulate into pending buffer and debounce (wait 1s for output to stabilize)
 			pendingOutput = cleaned
-			pendingTimer.Reset(1 * time.Second)
+			resetTimer(pendingTimer, 1*time.Second)
 
 		case <-pendingTimer.C:
 			if pendingOutput == "" || pendingOutput == lastSentContent {
@@ -85,7 +88,7 @@ func (sm *SessionManager) watchOutput(agent *Agent, session *Session, channelNam
 			log.Printf("[watcher] sending %d chars for session %s", len(pendingOutput), session.Name)
 			lastSentContent = pendingOutput
 
-			for _, chunk := range splitMessage(pendingOutput, maxMsgLen) {
+			for _, chunk := range splitMessage(pendingOutput, sm.channel.MaxMessageLength(channelName)) {
 				if err := sm.channel.Send(channelName, chatID, channels.OutboundMessage{
 					Text:   chunk,
 					Format: "text",
@@ -96,6 +99,16 @@ func (sm *SessionManager) watchOutput(agent *Agent, session *Session, channelNam
 			pendingOutput = ""
 		}
 	}
+}
+
+func resetTimer(timer *time.Timer, d time.Duration) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(d)
 }
 
 // extractNewLines returns only the lines that are new in currentOutput.

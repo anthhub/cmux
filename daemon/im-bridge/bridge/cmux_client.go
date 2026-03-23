@@ -10,15 +10,18 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // CmuxClient communicates with a cmux instance via its Unix socket (JSON-RPC v2).
 type CmuxClient struct {
-	socketPath string
-	conn       net.Conn
-	reader     *bufio.Reader
-	requestID  atomic.Int64
-	mu         sync.Mutex
+	socketPath           string
+	conn                 net.Conn
+	reader               *bufio.Reader
+	requestID            atomic.Int64
+	mu                   sync.Mutex
+	lastReconnectAttempt time.Time
+	reconnectBackoff     time.Duration
 }
 
 // jsonRPCRequest is the JSON-RPC 2.0 request format.
@@ -44,18 +47,29 @@ type jsonRPCError struct {
 
 // WorkspaceInfo represents a cmux workspace.
 type WorkspaceInfo struct {
-	ID    string `json:"id"`
-	Name  string `json:"name"`
-	Title string `json:"title"`
-	Ref   string `json:"ref"`
+	ID       string `json:"id"`
+	Title    string `json:"title"`
+	Ref      string `json:"ref"`
+	Index    int    `json:"index"`
+	Selected bool   `json:"selected"`
 }
 
 // SurfaceInfo represents a cmux surface (terminal/browser panel).
 type SurfaceInfo struct {
-	ID    string `json:"id"`
-	Ref   string `json:"ref"`
-	Type  string `json:"type"`
-	Title string `json:"title"`
+	ID      string `json:"id"`
+	Ref     string `json:"ref"`
+	Type    string `json:"type"`
+	Title   string `json:"title"`
+	Focused bool   `json:"focused"`
+	Index   int    `json:"index"`
+}
+
+// PaneInfo represents a pane inside a workspace.
+type PaneInfo struct {
+	ID           string `json:"id"`
+	Ref          string `json:"ref"`
+	Focused      bool   `json:"focused"`
+	SurfaceCount int    `json:"surface_count"`
 }
 
 // API response wrappers (cmux returns nested structures)
@@ -68,9 +82,42 @@ type workspaceListResult struct {
 	Workspaces []WorkspaceInfo `json:"workspaces"`
 }
 
+type surfaceCreateResult struct {
+	SurfaceID  string `json:"surface_id"`
+	SurfaceRef string `json:"surface_ref"`
+	PaneID     string `json:"pane_id"`
+	PaneRef    string `json:"pane_ref"`
+}
+
 type surfaceListResult struct {
 	Surfaces    []SurfaceInfo `json:"surfaces"`
 	WorkspaceID string        `json:"workspace_id"`
+}
+
+type paneListResult struct {
+	Panes       []PaneInfo `json:"panes"`
+	WorkspaceID string     `json:"workspace_id"`
+}
+
+type readTextResult struct {
+	Text      string `json:"text"`
+	SurfaceID string `json:"surface_id"`
+}
+
+type browserScreenshotResult struct {
+	WorkspaceID string `json:"workspace_id"`
+	SurfaceID   string `json:"surface_id"`
+	Path        string `json:"path"`
+	URL         string `json:"url"`
+	PNGBase64   string `json:"png_base64"`
+}
+
+type panelSnapshotResult struct {
+	SurfaceID     string `json:"surface_id"`
+	ChangedPixels int    `json:"changed_pixels"`
+	Width         int    `json:"width"`
+	Height        int    `json:"height"`
+	Path          string `json:"path"`
 }
 
 // NewCmuxClient creates a new client. If socketPath is empty, auto-discovers.
@@ -83,21 +130,23 @@ func NewCmuxClient(socketPath string) *CmuxClient {
 
 // Connect establishes connection to the cmux socket.
 func (c *CmuxClient) Connect() error {
-	conn, err := net.Dial("unix", c.socketPath)
-	if err != nil {
-		return fmt.Errorf("failed to connect to cmux socket %s: %w", c.socketPath, err)
-	}
-	c.conn = conn
-	c.reader = bufio.NewReader(conn)
-	return nil
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.connectLocked()
 }
 
 // Close closes the socket connection.
 func (c *CmuxClient) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var err error
 	if c.conn != nil {
-		return c.conn.Close()
+		err = c.conn.Close()
 	}
-	return nil
+	c.conn = nil
+	c.reader = nil
+	return err
 }
 
 // Call sends a JSON-RPC v2 request and returns the result.
@@ -105,10 +154,8 @@ func (c *CmuxClient) Call(method string, params interface{}) (json.RawMessage, e
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.conn == nil {
-		if err := c.Connect(); err != nil {
-			return nil, err
-		}
+	if err := c.connectLocked(); err != nil {
+		return nil, err
 	}
 
 	id := c.requestID.Add(1)
@@ -124,17 +171,15 @@ func (c *CmuxClient) Call(method string, params interface{}) (json.RawMessage, e
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	// Send request (newline-delimited)
 	data = append(data, '\n')
 	if _, err := c.conn.Write(data); err != nil {
-		c.conn = nil // reset connection on write error
+		c.resetLocked()
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
 
-	// Read response (may be large, read until newline)
 	line, err := c.reader.ReadBytes('\n')
 	if err != nil {
-		c.conn = nil
+		c.resetLocked()
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 	line = bytes.TrimSpace(line)
@@ -151,6 +196,54 @@ func (c *CmuxClient) Call(method string, params interface{}) (json.RawMessage, e
 	return resp.Result, nil
 }
 
+func (c *CmuxClient) connectLocked() error {
+	if c.conn != nil {
+		return nil
+	}
+
+	if !c.lastReconnectAttempt.IsZero() && c.reconnectBackoff > 0 {
+		if wait := time.Until(c.lastReconnectAttempt.Add(c.reconnectBackoff)); wait > 0 {
+			time.Sleep(wait)
+		}
+	}
+
+	conn, err := net.Dial("unix", c.socketPath)
+	c.lastReconnectAttempt = time.Now()
+	if err != nil {
+		if c.reconnectBackoff == 0 {
+			c.reconnectBackoff = time.Second
+		} else {
+			c.reconnectBackoff *= 2
+			if c.reconnectBackoff > 30*time.Second {
+				c.reconnectBackoff = 30 * time.Second
+			}
+		}
+		return fmt.Errorf("failed to connect to cmux socket %s: %w", c.socketPath, err)
+	}
+
+	c.conn = conn
+	c.reader = bufio.NewReader(conn)
+	c.reconnectBackoff = 0
+	return nil
+}
+
+func (c *CmuxClient) resetLocked() {
+	if c.conn != nil {
+		_ = c.conn.Close()
+	}
+	c.conn = nil
+	c.reader = nil
+	if c.reconnectBackoff == 0 {
+		c.reconnectBackoff = time.Second
+	} else {
+		c.reconnectBackoff *= 2
+		if c.reconnectBackoff > 30*time.Second {
+			c.reconnectBackoff = 30 * time.Second
+		}
+	}
+	c.lastReconnectAttempt = time.Now()
+}
+
 // Ping tests the connection.
 func (c *CmuxClient) Ping() error {
 	_, err := c.Call("system.ping", nil)
@@ -159,11 +252,7 @@ func (c *CmuxClient) Ping() error {
 
 // CreateWorkspace creates a new workspace.
 func (c *CmuxClient) CreateWorkspace(name string) (*WorkspaceInfo, error) {
-	params := map[string]interface{}{}
-	if name != "" {
-		params["name"] = name
-	}
-	result, err := c.Call("workspace.create", params)
+	result, err := c.Call("workspace.create", map[string]interface{}{})
 	if err != nil {
 		return nil, err
 	}
@@ -171,10 +260,17 @@ func (c *CmuxClient) CreateWorkspace(name string) (*WorkspaceInfo, error) {
 	if err := json.Unmarshal(result, &resp); err != nil {
 		return nil, fmt.Errorf("failed to parse workspace.create response: %w", err)
 	}
-	return &WorkspaceInfo{
+	workspace := &WorkspaceInfo{
 		ID:  resp.WorkspaceID,
 		Ref: resp.WorkspaceRef,
-	}, nil
+	}
+	if name != "" {
+		if err := c.RenameWorkspace(workspace.ID, name); err != nil {
+			return nil, err
+		}
+		workspace.Title = name
+	}
+	return workspace, nil
 }
 
 // ListWorkspaces returns all workspaces.
@@ -207,6 +303,23 @@ func (c *CmuxClient) ListSurfaces(workspaceID string) ([]SurfaceInfo, error) {
 	return resp.Surfaces, nil
 }
 
+// ListPanes returns panes in a workspace.
+func (c *CmuxClient) ListPanes(workspaceID string) ([]PaneInfo, error) {
+	params := map[string]interface{}{}
+	if workspaceID != "" {
+		params["workspace_id"] = workspaceID
+	}
+	result, err := c.Call("pane.list", params)
+	if err != nil {
+		return nil, err
+	}
+	var resp paneListResult
+	if err := json.Unmarshal(result, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse pane.list response: %w", err)
+	}
+	return resp.Panes, nil
+}
+
 // CreateSurface creates a new surface (tab) in a workspace.
 func (c *CmuxClient) CreateSurface(workspaceID string) (*SurfaceInfo, error) {
 	params := map[string]interface{}{
@@ -216,33 +329,61 @@ func (c *CmuxClient) CreateSurface(workspaceID string) (*SurfaceInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	var s SurfaceInfo
-	if err := json.Unmarshal(result, &s); err != nil {
-		return nil, err
+	var resp surfaceCreateResult
+	if err := json.Unmarshal(result, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse surface.create response: %w", err)
 	}
-	return &s, nil
+	return &SurfaceInfo{
+		ID:   resp.SurfaceID,
+		Ref:  resp.SurfaceRef,
+		Type: "terminal",
+	}, nil
 }
 
 // SendText sends text to a terminal surface.
-func (c *CmuxClient) SendText(surfaceID, text string) error {
-	_, err := c.Call("surface.send_text", map[string]interface{}{
-		"id":   surfaceID,
-		"text": text,
-	})
+func (c *CmuxClient) SendText(workspaceID, surfaceID, text string) error {
+	params := map[string]interface{}{
+		"surface_id": surfaceID,
+		"text":       text,
+	}
+	if workspaceID != "" {
+		params["workspace_id"] = workspaceID
+	}
+	_, err := c.Call("surface.send_text", params)
 	return err
 }
 
-// readTextResult is the response from surface.read_text.
-type readTextResult struct {
-	Text      string `json:"text"`
-	SurfaceID string `json:"surface_id"`
+// SendKey sends a key chord to a surface, e.g. "ctrl+c".
+func (c *CmuxClient) SendKey(workspaceID, surfaceID, key string) error {
+	params := map[string]interface{}{
+		"surface_id": surfaceID,
+		"key":        key,
+	}
+	if workspaceID != "" {
+		params["workspace_id"] = workspaceID
+	}
+	_, err := c.Call("surface.send_key", params)
+	return err
 }
 
 // ReadText reads the current screen content of a surface.
-func (c *CmuxClient) ReadText(surfaceID string) (string, error) {
-	result, err := c.Call("surface.read_text", map[string]interface{}{
-		"id": surfaceID,
-	})
+func (c *CmuxClient) ReadText(workspaceID, surfaceID string) (string, error) {
+	return c.ReadTextLines(workspaceID, surfaceID, 0)
+}
+
+// ReadTextLines reads the current screen content of a surface with optional scrollback lines.
+func (c *CmuxClient) ReadTextLines(workspaceID, surfaceID string, lines int) (string, error) {
+	params := map[string]interface{}{
+		"surface_id": surfaceID,
+	}
+	if workspaceID != "" {
+		params["workspace_id"] = workspaceID
+	}
+	if lines > 0 {
+		params["lines"] = lines
+		params["scrollback"] = true
+	}
+	result, err := c.Call("surface.read_text", params)
 	if err != nil {
 		return "", err
 	}
@@ -254,16 +395,169 @@ func (c *CmuxClient) ReadText(surfaceID string) (string, error) {
 }
 
 // FocusSurface focuses a specific surface.
-func (c *CmuxClient) FocusSurface(surfaceID string) error {
-	_, err := c.Call("surface.focus", map[string]interface{}{
-		"id": surfaceID,
+func (c *CmuxClient) FocusSurface(workspaceID, surfaceID string) error {
+	params := map[string]interface{}{
+		"surface_id": surfaceID,
+	}
+	if workspaceID != "" {
+		params["workspace_id"] = workspaceID
+	}
+	_, err := c.Call("surface.focus", params)
+	return err
+}
+
+// CloseSurface closes a specific surface.
+func (c *CmuxClient) CloseSurface(workspaceID, surfaceID string) error {
+	params := map[string]interface{}{
+		"surface_id": surfaceID,
+	}
+	if workspaceID != "" {
+		params["workspace_id"] = workspaceID
+	}
+	_, err := c.Call("surface.close", params)
+	return err
+}
+
+// SplitSurface splits the current surface and returns the newly created surface.
+func (c *CmuxClient) SplitSurface(workspaceID, surfaceID, direction string) (*SurfaceInfo, error) {
+	params := map[string]interface{}{
+		"surface_id": surfaceID,
+		"direction":  direction,
+	}
+	if workspaceID != "" {
+		params["workspace_id"] = workspaceID
+	}
+	result, err := c.Call("surface.split", params)
+	if err != nil {
+		return nil, err
+	}
+	var resp surfaceCreateResult
+	if err := json.Unmarshal(result, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse surface.split response: %w", err)
+	}
+	return &SurfaceInfo{
+		ID:   resp.SurfaceID,
+		Ref:  resp.SurfaceRef,
+		Type: "terminal",
+	}, nil
+}
+
+// RenameWorkspace sets a stable title for an IM-managed workspace.
+func (c *CmuxClient) RenameWorkspace(workspaceID, title string) error {
+	_, err := c.Call("workspace.rename", map[string]interface{}{
+		"workspace_id": workspaceID,
+		"title":        title,
 	})
 	return err
 }
 
+// SelectWorkspace switches the active workspace.
+func (c *CmuxClient) SelectWorkspace(workspaceID string) error {
+	_, err := c.Call("workspace.select", map[string]interface{}{
+		"workspace_id": workspaceID,
+	})
+	return err
+}
+
+// RenameSurface sets a stable title for a surface so IM sessions can be recovered by name.
+func (c *CmuxClient) RenameSurface(workspaceID, surfaceID, title string) error {
+	params := map[string]interface{}{
+		"surface_id": surfaceID,
+		"action":     "rename",
+		"title":      title,
+	}
+	if workspaceID != "" {
+		params["workspace_id"] = workspaceID
+	}
+	_, err := c.Call("tab.action", params)
+	return err
+}
+
+// BrowserScreenshot captures a browser surface.
+func (c *CmuxClient) BrowserScreenshot(workspaceID, surfaceID string) (*browserScreenshotResult, error) {
+	params := map[string]interface{}{
+		"surface_id": surfaceID,
+	}
+	if workspaceID != "" {
+		params["workspace_id"] = workspaceID
+	}
+	result, err := c.Call("browser.screenshot", params)
+	if err != nil {
+		return nil, err
+	}
+	var resp browserScreenshotResult
+	if err := json.Unmarshal(result, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse browser.screenshot response: %w", err)
+	}
+	return &resp, nil
+}
+
+// OpenBrowserSplit opens a browser split anchored to the current surface/workspace.
+func (c *CmuxClient) OpenBrowserSplit(workspaceID, surfaceID, url string) (*SurfaceInfo, error) {
+	params := map[string]interface{}{}
+	if workspaceID != "" {
+		params["workspace_id"] = workspaceID
+	}
+	if surfaceID != "" {
+		params["surface_id"] = surfaceID
+	}
+	if url != "" {
+		params["url"] = url
+	}
+	result, err := c.Call("browser.open_split", params)
+	if err != nil {
+		return nil, err
+	}
+	var resp surfaceCreateResult
+	if err := json.Unmarshal(result, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse browser.open_split response: %w", err)
+	}
+	return &SurfaceInfo{
+		ID:   resp.SurfaceID,
+		Ref:  resp.SurfaceRef,
+		Type: "browser",
+	}, nil
+}
+
+// NavigateBrowser navigates an existing browser surface.
+func (c *CmuxClient) NavigateBrowser(surfaceID, url string) error {
+	_, err := c.Call("browser.navigate", map[string]interface{}{
+		"surface_id": surfaceID,
+		"url":        url,
+	})
+	return err
+}
+
+// SystemTree returns the raw system.tree payload.
+func (c *CmuxClient) SystemTree(workspaceID string) (json.RawMessage, error) {
+	params := map[string]interface{}{}
+	if workspaceID != "" {
+		params["workspace_id"] = workspaceID
+	}
+	return c.Call("system.tree", params)
+}
+
+// DebugPanelSnapshot captures a surface image in DEBUG builds.
+func (c *CmuxClient) DebugPanelSnapshot(surfaceID, label string) (*panelSnapshotResult, error) {
+	params := map[string]interface{}{
+		"surface_id": surfaceID,
+	}
+	if label != "" {
+		params["label"] = label
+	}
+	result, err := c.Call("debug.panel_snapshot", params)
+	if err != nil {
+		return nil, err
+	}
+	var resp panelSnapshotResult
+	if err := json.Unmarshal(result, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse debug.panel_snapshot response: %w", err)
+	}
+	return &resp, nil
+}
+
 // discoverSocketPath finds the cmux socket path.
 func discoverSocketPath() string {
-	// 1. Environment variable
 	if path := os.Getenv("CMUX_SOCKET"); path != "" {
 		return path
 	}
@@ -271,13 +565,11 @@ func discoverSocketPath() string {
 		return path
 	}
 
-	// 2. Stable default path
 	home, _ := os.UserHomeDir()
 	stablePath := filepath.Join(home, "Library", "Application Support", "cmux", "cmux.sock")
 	if _, err := os.Stat(stablePath); err == nil {
 		return stablePath
 	}
 
-	// 3. Fallback
 	return "/tmp/cmux.sock"
 }

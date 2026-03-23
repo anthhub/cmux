@@ -3,8 +3,10 @@ package channels
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"strconv"
+	"sync"
 	"time"
 
 	tele "gopkg.in/telebot.v4"
@@ -63,9 +65,81 @@ func (tc *TelegramChannel) Stop() error {
 }
 
 func (tc *TelegramChannel) Send(chatID string, msg OutboundMessage) error {
-	id, err := strconv.ParseInt(chatID, 10, 64)
+	_, err := tc.send(chatID, msg)
+	return err
+}
+
+func (tc *TelegramChannel) SendStreaming(chatID string, msg OutboundMessage) (string, error) {
+	sent, err := tc.send(chatID, msg)
+	if err != nil {
+		return "", err
+	}
+	return strconv.Itoa(sent.ID), nil
+}
+
+func (tc *TelegramChannel) EditStreaming(chatID, messageID string, msg OutboundMessage) error {
+	chatIDInt, err := strconv.ParseInt(chatID, 10, 64)
 	if err != nil {
 		return fmt.Errorf("invalid chat ID: %w", err)
+	}
+
+	opts := &tele.SendOptions{}
+	if msg.Format == "markdown" || msg.Format == "code" {
+		opts.ParseMode = tele.ModeMarkdownV2
+	}
+
+	stored := tele.StoredMessage{
+		MessageID: messageID,
+		ChatID:    chatIDInt,
+	}
+	_, err = tc.bot.Edit(stored, msg.Text, opts)
+	if err != nil && opts.ParseMode != "" {
+		_, err = tc.bot.Edit(stored, msg.Text)
+	}
+	return err
+}
+
+func (tc *TelegramChannel) SendTyping(chatID string) (func(), error) {
+	id, err := strconv.ParseInt(chatID, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid chat ID: %w", err)
+	}
+
+	chat := &tele.Chat{ID: id}
+	if err := tc.bot.Notify(chat, tele.Typing); err != nil {
+		return nil, err
+	}
+
+	stopCh := make(chan struct{})
+	var once sync.Once
+	go func() {
+		ticker := time.NewTicker(4 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-ticker.C:
+				if err := tc.bot.Notify(chat, tele.Typing); err != nil {
+					log.Printf("[telegram] typing notify failed: %v", err)
+				}
+			}
+		}
+	}()
+
+	return func() {
+		once.Do(func() { close(stopCh) })
+	}, nil
+}
+
+func (tc *TelegramChannel) MaxMessageLength() int {
+	return 4096
+}
+
+func (tc *TelegramChannel) send(chatID string, msg OutboundMessage) (*tele.Message, error) {
+	id, err := strconv.ParseInt(chatID, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid chat ID: %w", err)
 	}
 
 	chat := &tele.Chat{ID: id}
@@ -78,8 +152,8 @@ func (tc *TelegramChannel) Send(chatID string, msg OutboundMessage) error {
 					File:    tele.FromReader(bytesReader(att.Data)),
 					Caption: msg.Text,
 				}
-				_, err := tc.bot.Send(chat, photo)
-				return err
+				sent, err := tc.bot.Send(chat, photo)
+				return sent, err
 			}
 		}
 	}
@@ -92,12 +166,12 @@ func (tc *TelegramChannel) Send(chatID string, msg OutboundMessage) error {
 
 	// For code format, the text is already wrapped in ```
 	// For plain text, send as-is
-	_, err = tc.bot.Send(chat, msg.Text, opts)
+	sent, err := tc.bot.Send(chat, msg.Text, opts)
 	if err != nil {
 		// Retry without parse mode if markdown fails
-		_, err = tc.bot.Send(chat, msg.Text)
+		sent, err = tc.bot.Send(chat, msg.Text)
 	}
-	return err
+	return sent, err
 }
 
 func (tc *TelegramChannel) OnMessage(handler func(msg InboundMessage)) {
@@ -116,7 +190,7 @@ func bytesReader(data []byte) *bytesReaderImpl {
 
 func (r *bytesReaderImpl) Read(p []byte) (n int, err error) {
 	if r.pos >= len(r.data) {
-		return 0, fmt.Errorf("EOF")
+		return 0, io.EOF
 	}
 	n = copy(p, r.data[r.pos:])
 	r.pos += n

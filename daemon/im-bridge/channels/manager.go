@@ -28,14 +28,19 @@ func (m *Manager) Register(ch Channel) {
 	m.channels[ch.Name()] = ch
 	ch.OnMessage(func(msg InboundMessage) {
 		msg.ChannelName = ch.Name()
-		if m.handler != nil {
-			m.handler(msg)
+		m.mu.RLock()
+		h := m.handler
+		m.mu.RUnlock()
+		if h != nil {
+			h(msg)
 		}
 	})
 }
 
 // OnMessage sets the global message handler for all channels.
 func (m *Manager) OnMessage(handler func(msg InboundMessage)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.handler = handler
 }
 
@@ -77,4 +82,74 @@ func (m *Manager) Send(channelName, chatID string, msg OutboundMessage) error {
 		return fmt.Errorf("channel %s not found", channelName)
 	}
 	return ch.Send(chatID, msg)
+}
+
+// SendTyping starts a typing indicator when supported by the channel.
+func (m *Manager) SendTyping(channelName, chatID string) (func(), error) {
+	m.mu.RLock()
+	ch, ok := m.channels[channelName]
+	m.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("channel %s not found", channelName)
+	}
+
+	typing, ok := ch.(TypingCapable)
+	if !ok {
+		return func() {}, nil
+	}
+	return typing.SendTyping(chatID)
+}
+
+// SendStreaming sends a message and returns its editable message ID when supported.
+func (m *Manager) SendStreaming(channelName, chatID string, msg OutboundMessage) (string, error) {
+	m.mu.RLock()
+	ch, ok := m.channels[channelName]
+	m.mu.RUnlock()
+	if !ok {
+		return "", fmt.Errorf("channel %s not found", channelName)
+	}
+
+	streaming, ok := ch.(StreamingCapable)
+	if !ok {
+		if err := ch.Send(chatID, msg); err != nil {
+			return "", err
+		}
+		return "", nil
+	}
+	return streaming.SendStreaming(chatID, msg)
+}
+
+// EditStreaming updates a previously sent streaming message.
+func (m *Manager) EditStreaming(channelName, chatID, messageID string, msg OutboundMessage) error {
+	m.mu.RLock()
+	ch, ok := m.channels[channelName]
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("channel %s not found", channelName)
+	}
+
+	streaming, ok := ch.(StreamingCapable)
+	if !ok {
+		return fmt.Errorf("channel %s does not support message edits", channelName)
+	}
+	return streaming.EditStreaming(chatID, messageID, msg)
+}
+
+// MaxMessageLength returns a safe maximum length for outbound text.
+func (m *Manager) MaxMessageLength(channelName string) int {
+	const fallback = 4000
+
+	m.mu.RLock()
+	ch, ok := m.channels[channelName]
+	m.mu.RUnlock()
+	if !ok {
+		return fallback
+	}
+
+	if provider, ok := ch.(MessageLengthProvider); ok {
+		if max := provider.MaxMessageLength(); max > 0 {
+			return max
+		}
+	}
+	return fallback
 }

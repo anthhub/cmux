@@ -1,0 +1,304 @@
+package bridge
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+	"sync"
+	"testing"
+)
+
+func TestCall_SendsCorrectJSONRPC(t *testing.T) {
+	var captured struct {
+		JSONRPC string          `json:"jsonrpc"`
+		Method  string          `json:"method"`
+		Params  json.RawMessage `json:"params"`
+		ID      int64           `json:"id"`
+	}
+	var mu sync.Mutex
+
+	sockPath := startMockCmuxSocket(t, func(method string, params json.RawMessage) (json.RawMessage, error) {
+		mu.Lock()
+		captured.Method = method
+		captured.Params = params
+		// We set jsonrpc and id from the raw request in the handler for simplicity;
+		// the mock already parsed them. Just verify method/params here.
+		mu.Unlock()
+		return json.RawMessage(`{"ok":true}`), nil
+	})
+
+	client := NewCmuxClient(sockPath)
+	defer client.Close()
+
+	_, err := client.Call("test.method", map[string]string{"key": "value"})
+	if err != nil {
+		t.Fatalf("Call failed: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if captured.Method != "test.method" {
+		t.Errorf("method = %q, want %q", captured.Method, "test.method")
+	}
+
+	var p map[string]string
+	if err := json.Unmarshal(captured.Params, &p); err != nil {
+		t.Fatalf("unmarshal params: %v", err)
+	}
+	if p["key"] != "value" {
+		t.Errorf("params[key] = %q, want %q", p["key"], "value")
+	}
+}
+
+func TestCall_ParsesSuccessResponse(t *testing.T) {
+	sockPath := startMockCmuxSocket(t, func(method string, params json.RawMessage) (json.RawMessage, error) {
+		return json.RawMessage(`{"answer":42}`), nil
+	})
+
+	client := NewCmuxClient(sockPath)
+	defer client.Close()
+
+	result, err := client.Call("test.method", nil)
+	if err != nil {
+		t.Fatalf("Call failed: %v", err)
+	}
+
+	var parsed map[string]int
+	if err := json.Unmarshal(result, &parsed); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+	if parsed["answer"] != 42 {
+		t.Errorf("answer = %d, want 42", parsed["answer"])
+	}
+}
+
+func TestCall_ParsesErrorResponse(t *testing.T) {
+	sockPath := startMockCmuxSocket(t, func(method string, params json.RawMessage) (json.RawMessage, error) {
+		return nil, fmt.Errorf("something went wrong")
+	})
+
+	client := NewCmuxClient(sockPath)
+	defer client.Close()
+
+	_, err := client.Call("test.method", nil)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "something went wrong") {
+		t.Errorf("error = %q, want to contain %q", err.Error(), "something went wrong")
+	}
+}
+
+func TestFocusSurface_UsesSurfaceIdParam(t *testing.T) {
+	var capturedParams json.RawMessage
+	var mu sync.Mutex
+
+	sockPath := startMockCmuxSocket(t, func(method string, params json.RawMessage) (json.RawMessage, error) {
+		mu.Lock()
+		capturedParams = params
+		mu.Unlock()
+		return json.RawMessage(`{}`), nil
+	})
+
+	client := NewCmuxClient(sockPath)
+	defer client.Close()
+
+	err := client.FocusSurface("ws-1", "surf-123")
+	if err != nil {
+		t.Fatalf("FocusSurface failed: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	var p map[string]string
+	if err := json.Unmarshal(capturedParams, &p); err != nil {
+		t.Fatalf("unmarshal params: %v", err)
+	}
+	if p["surface_id"] != "surf-123" {
+		t.Errorf("surface_id = %q, want %q", p["surface_id"], "surf-123")
+	}
+	if p["workspace_id"] != "ws-1" {
+		t.Errorf("workspace_id = %q, want %q", p["workspace_id"], "ws-1")
+	}
+}
+
+func TestSendText_UsesSurfaceIdParam(t *testing.T) {
+	var capturedParams json.RawMessage
+	var mu sync.Mutex
+
+	sockPath := startMockCmuxSocket(t, func(method string, params json.RawMessage) (json.RawMessage, error) {
+		mu.Lock()
+		capturedParams = params
+		mu.Unlock()
+		return json.RawMessage(`{}`), nil
+	})
+
+	client := NewCmuxClient(sockPath)
+	defer client.Close()
+
+	err := client.SendText("ws-1", "surf-456", "hello world")
+	if err != nil {
+		t.Fatalf("SendText failed: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	var p map[string]string
+	if err := json.Unmarshal(capturedParams, &p); err != nil {
+		t.Fatalf("unmarshal params: %v", err)
+	}
+	if p["surface_id"] != "surf-456" {
+		t.Errorf("surface_id = %q, want %q", p["surface_id"], "surf-456")
+	}
+	if p["text"] != "hello world" {
+		t.Errorf("text = %q, want %q", p["text"], "hello world")
+	}
+}
+
+func TestReadText_UsesSurfaceIdParam(t *testing.T) {
+	var capturedParams json.RawMessage
+	var mu sync.Mutex
+
+	sockPath := startMockCmuxSocket(t, func(method string, params json.RawMessage) (json.RawMessage, error) {
+		mu.Lock()
+		capturedParams = params
+		mu.Unlock()
+		return json.RawMessage(`{"text":"screen content","surface_id":"surf-789"}`), nil
+	})
+
+	client := NewCmuxClient(sockPath)
+	defer client.Close()
+
+	text, err := client.ReadText("ws-1", "surf-789")
+	if err != nil {
+		t.Fatalf("ReadText failed: %v", err)
+	}
+	if text != "screen content" {
+		t.Errorf("text = %q, want %q", text, "screen content")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	var p map[string]string
+	if err := json.Unmarshal(capturedParams, &p); err != nil {
+		t.Fatalf("unmarshal params: %v", err)
+	}
+	if p["surface_id"] != "surf-789" {
+		t.Errorf("surface_id = %q, want %q", p["surface_id"], "surf-789")
+	}
+}
+
+func TestCreateSurface_ParsesCorrectFields(t *testing.T) {
+	sockPath := startMockCmuxSocket(t, func(method string, params json.RawMessage) (json.RawMessage, error) {
+		return json.RawMessage(`{"surface_id":"s-1","surface_ref":"ref-1","pane_id":"p-1","pane_ref":"pref-1"}`), nil
+	})
+
+	client := NewCmuxClient(sockPath)
+	defer client.Close()
+
+	info, err := client.CreateSurface("ws-1")
+	if err != nil {
+		t.Fatalf("CreateSurface failed: %v", err)
+	}
+	if info.ID != "s-1" {
+		t.Errorf("ID = %q, want %q", info.ID, "s-1")
+	}
+	if info.Ref != "ref-1" {
+		t.Errorf("Ref = %q, want %q", info.Ref, "ref-1")
+	}
+	if info.Type != "terminal" {
+		t.Errorf("Type = %q, want %q", info.Type, "terminal")
+	}
+}
+
+func TestPing_Success(t *testing.T) {
+	sockPath := startMockCmuxSocket(t, func(method string, params json.RawMessage) (json.RawMessage, error) {
+		if method != "system.ping" {
+			return nil, fmt.Errorf("unexpected method: %s", method)
+		}
+		return json.RawMessage(`{"pong":true}`), nil
+	})
+
+	client := NewCmuxClient(sockPath)
+	defer client.Close()
+
+	if err := client.Ping(); err != nil {
+		t.Fatalf("Ping failed: %v", err)
+	}
+}
+
+func TestCreateWorkspace_Success(t *testing.T) {
+	callCount := 0
+	sockPath := startMockCmuxSocket(t, func(method string, params json.RawMessage) (json.RawMessage, error) {
+		callCount++
+		switch method {
+		case "workspace.create":
+			return json.RawMessage(`{"workspace_id":"ws-new","workspace_ref":"ref-new"}`), nil
+		case "workspace.rename":
+			return json.RawMessage(`{}`), nil
+		default:
+			return nil, fmt.Errorf("unexpected method: %s", method)
+		}
+	})
+
+	client := NewCmuxClient(sockPath)
+	defer client.Close()
+
+	ws, err := client.CreateWorkspace("my-workspace")
+	if err != nil {
+		t.Fatalf("CreateWorkspace failed: %v", err)
+	}
+	if ws.ID != "ws-new" {
+		t.Errorf("ID = %q, want %q", ws.ID, "ws-new")
+	}
+	if ws.Title != "my-workspace" {
+		t.Errorf("Title = %q, want %q", ws.Title, "my-workspace")
+	}
+}
+
+func TestListWorkspaces_Success(t *testing.T) {
+	sockPath := startMockCmuxSocket(t, func(method string, params json.RawMessage) (json.RawMessage, error) {
+		return json.RawMessage(`{"workspaces":[{"id":"ws-1","title":"First","index":0},{"id":"ws-2","title":"Second","index":1}]}`), nil
+	})
+
+	client := NewCmuxClient(sockPath)
+	defer client.Close()
+
+	workspaces, err := client.ListWorkspaces()
+	if err != nil {
+		t.Fatalf("ListWorkspaces failed: %v", err)
+	}
+	if len(workspaces) != 2 {
+		t.Fatalf("len = %d, want 2", len(workspaces))
+	}
+	if workspaces[0].ID != "ws-1" {
+		t.Errorf("workspaces[0].ID = %q, want %q", workspaces[0].ID, "ws-1")
+	}
+	if workspaces[1].Title != "Second" {
+		t.Errorf("workspaces[1].Title = %q, want %q", workspaces[1].Title, "Second")
+	}
+}
+
+func TestReconnect_WithBackoff(t *testing.T) {
+	// Use a non-existent socket path
+	client := NewCmuxClient("/tmp/nonexistent-test-socket.sock")
+	defer client.Close()
+
+	_, err := client.Call("test", nil)
+	if err == nil {
+		t.Fatal("expected error for non-existent socket")
+	}
+	if !strings.Contains(err.Error(), "failed to connect") {
+		t.Errorf("error = %q, want to contain 'failed to connect'", err.Error())
+	}
+
+	// Second call should also fail but backoff should be set
+	_, err = client.Call("test", nil)
+	if err == nil {
+		t.Fatal("expected error on second call")
+	}
+}

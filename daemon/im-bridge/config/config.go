@@ -9,6 +9,7 @@ import (
 // Config is the top-level configuration for the IM bridge.
 type Config struct {
 	Cmux     CmuxConfig     `yaml:"cmux"`
+	AI       AIConfig       `yaml:"ai"`
 	Telegram TelegramConfig `yaml:"telegram"`
 	Slack    SlackConfig    `yaml:"slack"`
 	Feishu   FeishuConfig   `yaml:"feishu"`
@@ -18,6 +19,18 @@ type Config struct {
 // CmuxConfig configures the cmux socket connection.
 type CmuxConfig struct {
 	SocketPath string `yaml:"socket_path"` // empty = auto-discover
+}
+
+// AIConfig configures subprocess-backed AI agents.
+type AIConfig struct {
+	DefaultAgent         string `yaml:"default_agent"`
+	Workdir              string `yaml:"workdir"`
+	ClaudePath           string `yaml:"claude_path"`
+	ClaudeModel          string `yaml:"claude_model"`
+	ClaudePermissionMode string `yaml:"claude_permission_mode"`
+	CodexPath            string `yaml:"codex_path"`
+	CodexModel           string `yaml:"codex_model"`
+	CodexSandbox         string `yaml:"codex_sandbox"`
 }
 
 // TelegramConfig configures the Telegram bot.
@@ -61,6 +74,18 @@ func Load(path string) (*Config, error) {
 	if token := os.Getenv("TELEGRAM_BOT_TOKEN"); token != "" {
 		cfg.Telegram.BotToken = token
 		cfg.Telegram.Enabled = true
+	}
+	if value := os.Getenv("CMUX_IM_BRIDGE_DEFAULT_AGENT"); value != "" {
+		cfg.AI.DefaultAgent = value
+	}
+	if value := os.Getenv("CMUX_IM_BRIDGE_WORKDIR"); value != "" {
+		cfg.AI.Workdir = value
+	}
+	if value := os.Getenv("CMUX_IM_BRIDGE_CLAUDE_PATH"); value != "" {
+		cfg.AI.ClaudePath = value
+	}
+	if value := os.Getenv("CMUX_IM_BRIDGE_CODEX_PATH"); value != "" {
+		cfg.AI.CodexPath = value
 	}
 
 	return &cfg, nil

@@ -36,6 +36,9 @@ func main() {
 	}
 	log.Println("[main] connected to cmux")
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// Setup channel manager
 	mgr := channels.NewManager()
 
@@ -50,7 +53,7 @@ func main() {
 	}
 
 	// Setup session manager
-	sessionMgr := bridge.NewSessionManager(cmuxClient, mgr)
+	sessionMgr := bridge.NewSessionManager(ctx, cmuxClient, mgr, cfg.AI)
 
 	// Route all IM messages to session manager
 	mgr.OnMessage(func(msg channels.InboundMessage) {
@@ -63,9 +66,6 @@ func main() {
 	})
 
 	// Start channels
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	if err := mgr.Start(ctx); err != nil {
 		log.Fatalf("failed to start channels: %v", err)
 	}
