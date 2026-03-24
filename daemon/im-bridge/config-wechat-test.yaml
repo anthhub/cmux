@@ -1,0 +1,33 @@
+cmux:
+  socket_path: "" # auto-discover
+
+ai:
+  default_agent: "claude"
+  workdir: "/Users/qiyuan/cmux"
+  claude_path: "claude"
+  claude_model: ""
+  claude_permission_mode: "auto"
+  codex_path: "codex"
+  codex_model: ""
+  codex_sandbox: "workspace-write"
+
+# Only WeChat enabled for testing
+telegram:
+  enabled: false
+
+slack:
+  enabled: false
+
+feishu:
+  enabled: false
+
+discord:
+  enabled: false
+
+wechat:
+  enabled: true
+  bot_token: "" # will use QR code login
+  credentials_dir: "" # default: ~/.weclaw/accounts
+
+security:
+  allowed_users: [] # allow all for testing

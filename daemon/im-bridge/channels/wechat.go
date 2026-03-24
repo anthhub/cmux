@@ -178,6 +178,7 @@ func (w *WeChatChannel) pollLoop(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
+			log.Printf("[wechat] poll error: %v", err)
 			log.Printf("[wechat] getUpdates error: %v, retrying in %v", err, backoff)
 			select {
 			case <-ctx.Done():
@@ -188,13 +189,27 @@ func (w *WeChatChannel) pollLoop(ctx context.Context) {
 			continue
 		}
 
-		// Handle session expired error.
+		// Handle session expired error — need to re-login.
 		if resp.Errcode == -14 {
-			log.Println("[wechat] session expired (errcode -14), resetting sync buffer")
+			log.Println("[wechat] session expired (errcode -14), clearing token and re-logging in...")
 			w.mu.Lock()
 			w.syncBuf = ""
+			w.botToken = ""
+			w.botID = ""
 			w.mu.Unlock()
 			w.saveCredentials()
+
+			if err := w.qrLogin(ctx); err != nil {
+				log.Printf("[wechat] re-login failed: %v, retrying in %v", err, backoff)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(backoff):
+				}
+				backoff = min(backoff*2, maxBackoff)
+				continue
+			}
+			log.Println("[wechat] re-login successful, resuming poll")
 			backoff = 3 * time.Second
 			continue
 		}
@@ -345,12 +360,14 @@ func (w *WeChatChannel) qrLogin(ctx context.Context) error {
 
 			switch statusResp.Status {
 			case "confirmed":
+				w.mu.Lock()
 				w.botToken = statusResp.BotToken
 				w.botID = statusResp.ILinkBotID
 				if statusResp.BaseURL != "" {
 					w.baseURL = statusResp.BaseURL
 				}
-				log.Printf("[wechat] QR login successful, bot ID: %s", w.botID)
+				w.mu.Unlock()
+				log.Printf("[wechat] QR login successful, bot ID: %s", statusResp.ILinkBotID)
 				w.saveCredentials()
 				return nil
 			case "expired":
@@ -371,9 +388,12 @@ func (w *WeChatChannel) qrLogin(ctx context.Context) error {
 }
 
 func (w *WeChatChannel) setAuthHeaders(req *http.Request) {
+	w.mu.Lock()
+	token := w.botToken
+	w.mu.Unlock()
 	req.Header.Set("Content-Type", "application/json")
-	if w.botToken != "" {
-		req.Header.Set("Authorization", "Bearer "+w.botToken)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	req.Header.Set("AuthorizationType", "ilink_bot_token")
 	req.Header.Set("X-WECHAT-UIN", w.uin)
@@ -514,7 +534,7 @@ type wechatImageItem struct {
 
 type wechatSendMsgReq struct {
 	BaseInfo wechatBaseInfo `json:"base_info"`
-	Message  wechatSendMsg  `json:"message"`
+	Message  wechatSendMsg  `json:"msg"`
 }
 
 type wechatSendMsg struct {
