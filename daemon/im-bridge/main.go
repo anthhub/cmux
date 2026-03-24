@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/manaflow-ai/cmux/daemon/im-bridge/bridge"
 	"github.com/manaflow-ai/cmux/daemon/im-bridge/channels"
@@ -23,12 +24,27 @@ func main() {
 		log.Fatalf("failed to load config: %v", err)
 	}
 
-	// Connect to cmux
-	cmuxClient := bridge.NewCmuxClient(cfg.Cmux.SocketPath)
-	if err := cmuxClient.Connect(); err != nil {
-		log.Fatalf("failed to connect to cmux: %v", err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Initialize multi-instance manager
+	instances := bridge.NewInstanceManager()
+	// Register primary cmux instance from config
+	if _, err := instances.Register(cfg.Cmux.SocketPath); err != nil {
+		log.Printf("[main] warning: primary cmux not reachable: %v", err)
 	}
-	defer cmuxClient.Close()
+	// Discover additional instances (staging, debug, nightly)
+	if err := instances.Discover(); err != nil {
+		log.Printf("[main] instance discovery: %v", err)
+	}
+	// Start periodic health checks
+	instances.StartHealthLoop(ctx, 30*time.Second)
+
+	// Obtain the primary client (falls back to any healthy instance)
+	cmuxClient, err := instances.Default()
+	if err != nil {
+		log.Fatalf("no reachable cmux instance: %v", err)
+	}
 
 	// Verify connection
 	if err := cmuxClient.Ping(); err != nil {
@@ -36,23 +52,54 @@ func main() {
 	}
 	log.Println("[main] connected to cmux")
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	// Setup channel manager
 	mgr := channels.NewManager()
 
-	// Register enabled channels
+	// Build a map from channel name to its typed config pointer.
+	channelConfigs := map[string]interface{}{
+		"telegram": &cfg.Telegram,
+		"slack":    &cfg.Slack,
+		"feishu":   &cfg.Feishu,
+		// TODO: add "discord": &cfg.Discord when DiscordConfig is added to config.Config
+	}
+
+	// Determine which channels are enabled via config flags.
+	enabledChannels := []string{}
 	if cfg.Telegram.Enabled {
-		tg, err := channels.NewTelegramChannel(cfg.Telegram.BotToken)
-		if err != nil {
-			log.Fatalf("failed to create telegram channel: %v", err)
+		enabledChannels = append(enabledChannels, "telegram")
+	}
+	if cfg.Slack.Enabled {
+		enabledChannels = append(enabledChannels, "slack")
+	}
+	if cfg.Feishu.Enabled {
+		enabledChannels = append(enabledChannels, "feishu")
+	}
+	// TODO: add Discord when DiscordConfig is wired into config.Config
+
+	// Register enabled channels via factory pattern
+	for _, name := range enabledChannels {
+		factory, ok := channels.GetFactory(name)
+		if !ok {
+			log.Printf("[main] unknown channel: %s, skipping", name)
+			continue
 		}
-		mgr.Register(tg)
-		log.Println("[main] telegram channel registered")
+
+		channelCfg, ok := channelConfigs[name]
+		if !ok {
+			log.Printf("[main] no config mapping for channel %s, skipping", name)
+			continue
+		}
+
+		ch, err := factory(channelCfg)
+		if err != nil {
+			log.Fatalf("[main] failed to create channel %s: %v", name, err)
+		}
+		mgr.Register(ch)
+		log.Printf("[main] channel %s registered", name)
 	}
 
 	// Setup session manager
+	// TODO: pass instances to SessionManager when it supports multi-instance routing
 	sessionMgr := bridge.NewSessionManager(ctx, cmuxClient, mgr, cfg.AI)
 
 	// Route all IM messages to session manager
