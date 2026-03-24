@@ -18,13 +18,37 @@ const (
 	StreamEventError          = "error"
 )
 
+// StreamEventUsage holds token usage from a result event.
+type StreamEventUsage struct {
+	InputTokens       int
+	CachedInputTokens int
+	OutputTokens      int
+}
+
 // StreamEvent is a normalized event from Claude Code or Codex JSON streams.
 type StreamEvent struct {
-	Type     string
-	Content  string
-	Provider string
-	Delta    bool
-	Meta     map[string]interface{}
+	Type      string
+	Content   string
+	Provider  string
+	Delta     bool
+	Meta      map[string]interface{}
+	SessionID string           // populated from result/init events
+	Usage     StreamEventUsage // populated from result events
+}
+
+// ParseLine attempts to parse a single terminal output line as a Claude or Codex stream-json event.
+// Returns the events and nil error on success; returns nil events and non-nil error if the line
+// is not valid JSON or does not contain a recognized event.
+func ParseLine(line string) ([]StreamEvent, error) {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || trimmed[0] != '{' {
+		return nil, fmt.Errorf("not a json line")
+	}
+	events, err := ParseClaudeStream([]byte(trimmed))
+	if err != nil {
+		return nil, err
+	}
+	return events, nil
 }
 
 // ParseClaudeStream normalizes one Claude stream-json line.
@@ -39,8 +63,9 @@ func ParseClaudeStream(line []byte) ([]StreamEvent, error) {
 	case "system":
 		if payload["subtype"] == "init" {
 			events = append(events, StreamEvent{
-				Type:     StreamEventInit,
-				Provider: "claude",
+				Type:      StreamEventInit,
+				Provider:  "claude",
+				SessionID: stringValue(payload["session_id"]),
 				Meta: map[string]interface{}{
 					"session_id": payload["session_id"],
 				},
@@ -123,12 +148,25 @@ func ParseClaudeStream(line []byte) ([]StreamEvent, error) {
 			Meta:     payload,
 		})
 	case "result":
-		events = append(events, StreamEvent{
-			Type:     StreamEventResult,
-			Provider: "claude",
-			Content:  stringValue(payload["result"]),
-			Meta:     payload,
-		})
+		ev := StreamEvent{
+			Type:      StreamEventResult,
+			Provider:  "claude",
+			Content:   stringValue(payload["result"]),
+			SessionID: stringValue(payload["session_id"]),
+			Meta:      payload,
+		}
+		if usage, ok := payload["usage"].(map[string]interface{}); ok {
+			if v, ok := usage["input_tokens"].(float64); ok {
+				ev.Usage.InputTokens = int(v)
+			}
+			if v, ok := usage["cache_read_input_tokens"].(float64); ok {
+				ev.Usage.CachedInputTokens = int(v)
+			}
+			if v, ok := usage["output_tokens"].(float64); ok {
+				ev.Usage.OutputTokens = int(v)
+			}
+		}
+		events = append(events, ev)
 	}
 
 	if payload["type"] == "error" {

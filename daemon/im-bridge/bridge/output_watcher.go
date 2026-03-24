@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	fastInterval = 500 * time.Millisecond
+	fastInterval = 200 * time.Millisecond
 	slowInterval = 2 * time.Second
 	idleInterval = 5 * time.Second
 )
@@ -21,15 +21,27 @@ const (
 // - Captures baseline BEFORE command, only sends genuinely NEW content
 // - Debounces rapid changes (waits for output to stabilize)
 // - Strips ANSI codes, cleans up terminal noise
+// - In AI mode, attempts to parse stream-json lines and route them through IMPresenter
 func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, session *Session, channelName, chatID string) {
 	log.Printf("[watcher] starting for session %s (surface %s)", session.Name, session.SurfaceID)
+
+	isAI := session.agentType() != AgentTypeShell
+
+	// For AI mode, create a per-turn presenter with a control_request callback.
+	var presenter *IMPresenter
+	if isAI {
+		presenter = NewIMPresenter(sm.channel, channelName, chatID, session.verbose())
+		presenter.onControlRequest = func(event StreamEvent) {
+			sm.handleStreamEvent(session, event)
+		}
+	}
 
 	ticker := time.NewTicker(fastInterval)
 	defer ticker.Stop()
 
 	idleCount := 0
 	lastSentContent := ""
-	// Pending output buffer — accumulate changes before sending
+	// Pending output buffer — accumulate changes before sending (shell mode only)
 	var pendingOutput string
 	pendingTimer := time.NewTimer(0)
 	<-pendingTimer.C // drain initial fire
@@ -38,10 +50,16 @@ func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, s
 		select {
 		case <-ctx.Done():
 			log.Printf("[watcher] context cancelled for session %s", session.Name)
+			if presenter != nil {
+				presenter.Close()
+			}
 			return
 		case <-ticker.C:
 			if !session.isWatching() {
 				log.Printf("[watcher] stopped for session %s", session.Name)
+				if presenter != nil {
+					presenter.Close()
+				}
 				return
 			}
 
@@ -71,18 +89,41 @@ func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, s
 			idleCount = 0
 			ticker.Reset(fastInterval)
 
-			cleaned := strings.TrimSpace(diff)
-			if cleaned == "" {
-				continue
-			}
-
-			// Accumulate into pending buffer and debounce (wait 1s for output to stabilize)
-			if pendingOutput == "" {
-				pendingOutput = cleaned
+			if isAI && presenter != nil {
+				// In AI mode: try to parse each new line as stream-json
+				for _, line := range strings.Split(diff, "\n") {
+					events, err := ParseLine(line)
+					if err != nil {
+						// Non-JSON line — fall through to plain-text path below
+						cleaned := strings.TrimSpace(line)
+						if cleaned != "" {
+							if pendingOutput == "" {
+								pendingOutput = cleaned
+							} else {
+								pendingOutput += "\n" + cleaned
+							}
+							resetTimer(pendingTimer, 1*time.Second)
+						}
+						continue
+					}
+					for _, event := range events {
+						presenter.HandleEvent(event)
+						sm.handleStreamEvent(session, event)
+					}
+				}
 			} else {
-				pendingOutput += "\n" + cleaned
+				// Shell mode: plain-text accumulation path
+				cleaned := strings.TrimSpace(diff)
+				if cleaned == "" {
+					continue
+				}
+				if pendingOutput == "" {
+					pendingOutput = cleaned
+				} else {
+					pendingOutput += "\n" + cleaned
+				}
+				resetTimer(pendingTimer, 1*time.Second)
 			}
-			resetTimer(pendingTimer, 1*time.Second)
 
 		case <-pendingTimer.C:
 			if pendingOutput == "" || pendingOutput == lastSentContent {

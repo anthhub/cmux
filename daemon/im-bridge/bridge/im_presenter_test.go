@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/manaflow-ai/cmux/daemon/im-bridge/channels"
 )
@@ -37,6 +38,7 @@ func newMockChannel(name string) *mockChannel {
 func (m *mockChannel) Name() string                                    { return m.name }
 func (m *mockChannel) Start(_ context.Context) error                   { m.running = true; return nil }
 func (m *mockChannel) Stop() error                                     { m.running = false; return nil }
+func (m *mockChannel) IsRunning() bool                                 { return m.running }
 func (m *mockChannel) OnMessage(handler func(channels.InboundMessage)) { m.handler = handler }
 
 func (m *mockChannel) Send(chatID string, msg channels.OutboundMessage) error {
@@ -72,6 +74,18 @@ func (m *mockChannel) getSent() []mockSentMsg {
 	cp := make([]mockSentMsg, len(m.sent))
 	copy(cp, m.sent)
 	return cp
+}
+
+func (m *mockChannel) waitForSent(n int, timeout time.Duration) []mockSentMsg {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		msgs := m.getSent()
+		if len(msgs) >= n {
+			return msgs
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return m.getSent()
 }
 
 func setupPresenter(t *testing.T, verbose bool) (*IMPresenter, *mockChannel) {
@@ -146,7 +160,7 @@ func TestIMPresenter_VerboseShowsToolUse(t *testing.T) {
 	})
 	presenter.Close()
 
-	sent := mock.getSent()
+	sent := mock.waitForSent(1, 2*time.Second)
 	if len(sent) == 0 {
 		t.Fatal("expected tool_use message in verbose mode")
 	}

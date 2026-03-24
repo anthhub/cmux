@@ -1,11 +1,25 @@
 package channels
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// Sentinel errors for channel operations.
+var (
+	// ErrNotRunning is returned when an operation is attempted on a stopped channel.
+	ErrNotRunning = errors.New("channel not running")
+	// ErrRateLimit is returned when the platform rate-limits the bot.
+	ErrRateLimit = errors.New("rate limited")
+	// ErrTemporary is returned for transient errors that may succeed on retry.
+	ErrTemporary = errors.New("temporary error")
+)
 
 // Channel defines the interface for IM platform adapters.
 // Each platform (Telegram, Slack, Feishu, etc.) implements this interface.
 type Channel interface {
 	Name() string
+	IsRunning() bool
 	Start(ctx context.Context) error
 	Stop() error
 	Send(chatID string, msg OutboundMessage) error

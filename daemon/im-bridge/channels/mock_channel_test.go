@@ -3,6 +3,7 @@ package channels
 import (
 	"context"
 	"sync"
+	"time"
 )
 
 // MockChannel implements Channel, StreamingCapable, and MessageLengthProvider for testing.
@@ -108,4 +109,18 @@ func (m *MockChannel) IsRunning() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.running
+}
+
+// WaitForMessages blocks until at least n messages have been received or the deadline passes.
+func (m *MockChannel) WaitForMessages(t interface{ Fatal(...interface{}) }, n int, timeout time.Duration) []OutboundMessage {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		msgs := m.Messages()
+		if len(msgs) >= n {
+			return msgs
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("timeout waiting for messages")
+	return nil
 }

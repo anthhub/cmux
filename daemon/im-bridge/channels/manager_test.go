@@ -18,7 +18,8 @@ func TestManager_RegisterAndRoute(t *testing.T) {
 		t.Fatalf("Send failed: %v", err)
 	}
 
-	msgs := mock.Messages()
+	// Send is async (worker goroutine); wait for the message to be processed.
+	msgs := mock.WaitForMessages(t, 1, time.Second)
 	if len(msgs) != 1 {
 		t.Fatalf("len = %d, want 1", len(msgs))
 	}
@@ -153,23 +154,27 @@ type failingMockChannel struct {
 	name     string
 	startErr error
 	stopped  bool
+	running  bool
 	handler  func(InboundMessage)
 }
 
 func (c *failingMockChannel) Name() string                           { return c.name }
+func (c *failingMockChannel) IsRunning() bool                        { return c.running }
 func (c *failingMockChannel) Start(_ context.Context) error          { return c.startErr }
-func (c *failingMockChannel) Stop() error                            { c.stopped = true; return nil }
+func (c *failingMockChannel) Stop() error                            { c.stopped = true; c.running = false; return nil }
 func (c *failingMockChannel) Send(_ string, _ OutboundMessage) error { return nil }
 func (c *failingMockChannel) OnMessage(h func(InboundMessage))       { c.handler = h }
 
 // nonTypingChannel is a minimal Channel that does NOT implement TypingCapable.
 type nonTypingChannel struct {
 	name    string
+	running bool
 	handler func(InboundMessage)
 }
 
 func (c *nonTypingChannel) Name() string                           { return c.name }
-func (c *nonTypingChannel) Start(_ context.Context) error          { return nil }
-func (c *nonTypingChannel) Stop() error                            { return nil }
+func (c *nonTypingChannel) IsRunning() bool                        { return c.running }
+func (c *nonTypingChannel) Start(_ context.Context) error          { c.running = true; return nil }
+func (c *nonTypingChannel) Stop() error                            { c.running = false; return nil }
 func (c *nonTypingChannel) Send(_ string, _ OutboundMessage) error { return nil }
 func (c *nonTypingChannel) OnMessage(h func(InboundMessage))       { c.handler = h }

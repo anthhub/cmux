@@ -28,6 +28,7 @@ func newSessionTestChannel(name string) *sessionTestChannel {
 func (c *sessionTestChannel) Name() string                { return c.name }
 func (c *sessionTestChannel) Start(context.Context) error { return nil }
 func (c *sessionTestChannel) Stop() error                 { return nil }
+func (c *sessionTestChannel) IsRunning() bool             { return true }
 func (c *sessionTestChannel) OnMessage(handler func(channels.InboundMessage)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -55,6 +56,24 @@ func (c *sessionTestChannel) Messages() []channels.OutboundMessage {
 	cp := make([]channels.OutboundMessage, len(c.messages))
 	copy(cp, c.messages)
 	return cp
+}
+
+// WaitForMessages polls until at least n messages are received or timeout elapses.
+func (c *sessionTestChannel) WaitForMessages(t *testing.T, n int, timeout time.Duration) []channels.OutboundMessage {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		msgs := c.Messages()
+		if len(msgs) >= n {
+			return msgs
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	msgs := c.Messages()
+	if len(msgs) < n {
+		t.Fatalf("timeout waiting for %d messages, got %d", n, len(msgs))
+	}
+	return msgs
 }
 
 func newTestSessionManager(t *testing.T, handler func(method string, params json.RawMessage) (json.RawMessage, error)) (*SessionManager, *sessionTestChannel, *CmuxClient) {
@@ -361,7 +380,7 @@ func TestReply_SplitsMessagesByChannelLimit(t *testing.T) {
 		ChatID:      "chat-1",
 	}, "1234567890")
 
-	messages := channel.Messages()
+	messages := channel.WaitForMessages(t, 2, 2*time.Second)
 	if len(messages) != 2 {
 		t.Fatalf("len(messages) = %d, want 2", len(messages))
 	}
@@ -405,15 +424,15 @@ func TestHandleResetSession_SendsCtrlCAndRelaunches(t *testing.T) {
 
 	sm.handleResetSession(agent, channels.InboundMessage{ChannelName: "test", ChatID: "chat-1"})
 
-	// Should have sent Ctrl+C then "claude\n"
+	// Should have sent Ctrl+C then the claude stream-json command
 	if len(sentTexts) < 2 {
 		t.Fatalf("expected at least 2 send_text calls, got %d", len(sentTexts))
 	}
 	if sentTexts[0] != "\x03" {
 		t.Fatalf("first send_text = %q, want ctrl-c", sentTexts[0])
 	}
-	if sentTexts[1] != "claude\n" {
-		t.Fatalf("second send_text = %q, want %q", sentTexts[1], "claude\n")
+	if !strings.HasPrefix(sentTexts[1], "claude -p --output-format stream-json") {
+		t.Fatalf("second send_text = %q, want claude stream-json command", sentTexts[1])
 	}
 
 	// Provider session ID should be cleared
@@ -421,7 +440,7 @@ func TestHandleResetSession_SendsCtrlCAndRelaunches(t *testing.T) {
 		t.Fatalf("providerSessionID = %q, want empty", got)
 	}
 
-	messages := channel.Messages()
+	messages := channel.WaitForMessages(t, 1, 2*time.Second)
 	if len(messages) == 0 {
 		t.Fatal("expected reset reply")
 	}
@@ -482,7 +501,7 @@ func TestHandleCloseSession_ClosesSessionSurface(t *testing.T) {
 
 	sm.handleCloseSession(agent, channels.InboundMessage{ChannelName: "test", ChatID: "chat-1"})
 
-	messages := channel.Messages()
+	messages := channel.WaitForMessages(t, 1, 2*time.Second)
 	if len(messages) == 0 {
 		t.Fatal("expected close reply")
 	}
@@ -515,7 +534,7 @@ func TestHandleFastCommand_CodexReportsUnsupported(t *testing.T) {
 		t.Fatalf("model = %q, want %q", got, "gpt-5.4")
 	}
 
-	messages := channel.Messages()
+	messages := channel.WaitForMessages(t, 1, 2*time.Second)
 	last := messages[len(messages)-1].Text
 	if !strings.Contains(last, "Fast mode currently maps to Claude presets only") {
 		t.Fatalf("reply = %q, want codex unsupported message", last)
@@ -542,7 +561,7 @@ func TestHandleThinkCommand_CodexReportsUnsupported(t *testing.T) {
 		t.Fatalf("effort = %q, want empty", got)
 	}
 
-	messages := channel.Messages()
+	messages := channel.WaitForMessages(t, 1, 2*time.Second)
 	last := messages[len(messages)-1].Text
 	if !strings.Contains(last, "Thinking effort is currently supported only for Claude sessions") {
 		t.Fatalf("reply = %q, want codex unsupported message", last)

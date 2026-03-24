@@ -84,6 +84,7 @@ type SessionManager struct {
 	channel          *channels.Manager
 	aiCfg            config.AIConfig
 	defaultAgentType string
+	presenter        *IMPresenter
 	mu               sync.RWMutex
 }
 
@@ -101,6 +102,7 @@ func NewSessionManager(ctx context.Context, cmux *CmuxClient, channel *channels.
 		channel:          channel,
 		aiCfg:            ai,
 		defaultAgentType: defaultType,
+		presenter:        nil, // initialized per-turn in watchOutput
 	}
 }
 
@@ -192,6 +194,8 @@ func (sm *SessionManager) handleCommand(user *UserState, agent *Agent, msg chann
 		sm.handleStop(agent, msg)
 	case "approve":
 		sm.handleApprove(agent, msg)
+	case "deny", "reject":
+		sm.handleDeny(agent, msg)
 	case "permission", "perm":
 		sm.handlePermissionCommand(agent, msg, args)
 	case "screenshot":
@@ -251,9 +255,9 @@ func (sm *SessionManager) ensureActiveAgent(user *UserState) (*Agent, error) {
 			} else if err := sm.syncAgentSessions(agent); err != nil {
 				return nil, err
 			}
-			if agentType := agent.defaultType(); agentType != AgentTypeShell {
-				if err := LaunchAgentInTerminal(sm.cmux, agent.workspaceID(), session.SurfaceID, agentType); err != nil {
-					log.Printf("[session] failed to launch %s in terminal for agent %s: %v", agentType, agent.Name, err)
+			if session.agentType() != AgentTypeShell {
+				if err := LaunchAgentInTerminal(sm.cmux, agent.workspaceID(), session.SurfaceID, session, sm.aiCfg); err != nil {
+					log.Printf("[session] failed to launch agent in terminal for agent %s: %v", agent.Name, err)
 				}
 			}
 		}
@@ -399,8 +403,8 @@ func (sm *SessionManager) handleNewSession(agent *Agent, msg channels.InboundMes
 	if session := agent.ActiveSession(); session != nil {
 		session.setAgentType(sessionType)
 		if sessionType != AgentTypeShell {
-			if err := LaunchAgentInTerminal(sm.cmux, agent.workspaceID(), surface.ID, sessionType); err != nil {
-				log.Printf("[session] failed to launch %s in new session %s: %v", sessionType, name, err)
+			if err := LaunchAgentInTerminal(sm.cmux, agent.workspaceID(), surface.ID, session, sm.aiCfg); err != nil {
+				log.Printf("[session] failed to launch agent in new session %s: %v", name, err)
 			}
 		}
 	}
@@ -519,9 +523,9 @@ func (sm *SessionManager) handleResetSession(agent *Agent, msg channels.InboundM
 	session.stopWatching()
 	// Send Ctrl+C to stop any running process, then relaunch the agent
 	_ = StopAgent(sm.cmux, agent.workspaceID(), session.SurfaceID)
-	if agentType := session.agentType(); agentType != AgentTypeShell {
-		if err := LaunchAgentInTerminal(sm.cmux, agent.workspaceID(), session.SurfaceID, agentType); err != nil {
-			log.Printf("[session] failed to relaunch %s after reset: %v", agentType, err)
+	if session.agentType() != AgentTypeShell {
+		if err := LaunchAgentInTerminal(sm.cmux, agent.workspaceID(), session.SurfaceID, session, sm.aiCfg); err != nil {
+			log.Printf("[session] failed to relaunch agent after reset: %v", err)
 		}
 	}
 	session.setProviderSessionID("")
@@ -551,7 +555,7 @@ func (sm *SessionManager) handleModelCommand(agent *Agent, msg channels.InboundM
 	}
 
 	session.setModel(strings.Join(args, " "))
-	sm.reply(msg, "Model set to: "+session.model())
+	sm.reply(msg, "Model set to: "+session.model()+". Use /reset to apply to running session.")
 }
 
 func (sm *SessionManager) handleThinkCommand(agent *Agent, msg channels.InboundMessage, args []string) {
@@ -583,7 +587,7 @@ func (sm *SessionManager) handleThinkCommand(agent *Agent, msg channels.InboundM
 		sm.reply(msg, "Usage: /think off|low|medium|high|max")
 		return
 	}
-	sm.reply(msg, "Thinking effort set to: "+value)
+	sm.reply(msg, "Thinking effort set to: "+value+". Use /reset to apply to running session.")
 }
 
 func (sm *SessionManager) handleFastCommand(agent *Agent, msg channels.InboundMessage, args []string) {
@@ -616,7 +620,7 @@ func (sm *SessionManager) handleFastCommand(agent *Agent, msg channels.InboundMe
 				session.Fast = true
 			}
 		}()
-		sm.reply(msg, "Fast mode on — model set to: sonnet")
+		sm.reply(msg, "Fast mode on — model set to: sonnet. Use /reset to apply to running session.")
 	case "off":
 		func() {
 			session.mu.Lock()
@@ -631,7 +635,7 @@ func (sm *SessionManager) handleFastCommand(agent *Agent, msg channels.InboundMe
 		if model == "" {
 			model = "(provider default)"
 		}
-		sm.reply(msg, "Fast mode off — model restored to: "+model)
+		sm.reply(msg, "Fast mode off — model restored to: "+model+". Use /reset to apply to running session.")
 	default:
 		sm.reply(msg, "Usage: /fast on|off")
 		return
@@ -780,8 +784,24 @@ func (sm *SessionManager) handleApprove(agent *Agent, msg channels.InboundMessag
 		sm.reply(msg, "No active session")
 		return
 	}
-	if session.agentType() != AgentTypeClaude {
-		sm.reply(msg, "Interactive /approve is currently only surfaced for Claude sessions.")
+	pending := strings.TrimSpace(session.pendingApproval())
+	if pending == "" {
+		sm.reply(msg, "No pending approval request.")
+		return
+	}
+
+	if err := sm.cmux.SendText(agent.workspaceID(), session.SurfaceID, "y\n"); err != nil {
+		sm.reply(msg, "Error sending approval: "+err.Error())
+		return
+	}
+	session.setPendingApproval("")
+	sm.reply(msg, "✓ Approved.")
+}
+
+func (sm *SessionManager) handleDeny(agent *Agent, msg channels.InboundMessage) {
+	session := agent.ActiveSession()
+	if session == nil {
+		sm.reply(msg, "No active session")
 		return
 	}
 	pending := strings.TrimSpace(session.pendingApproval())
@@ -790,22 +810,12 @@ func (sm *SessionManager) handleApprove(agent *Agent, msg channels.InboundMessag
 		return
 	}
 
-	perm := session.permissionMode()
-	if perm == "" {
-		perm = sm.aiCfg.ClaudePermissionMode
+	if err := sm.cmux.SendText(agent.workspaceID(), session.SurfaceID, "n\n"); err != nil {
+		sm.reply(msg, "Error sending denial: "+err.Error())
+		return
 	}
-	if perm == "" {
-		perm = "(not set)"
-	}
-
-	sm.reply(msg, fmt.Sprintf(
-		"Claude Code runs interactively in the terminal.\n"+
-			"Use /permission <mode> to change how approvals are handled.\n\n"+
-			"Current permission mode: %s\n"+
-			"Pending request was: %s\n\n"+
-			"Valid modes: default, plan, bypassPermissions, auto",
-		perm, pending,
-	))
+	session.setPendingApproval("")
+	sm.reply(msg, "✗ Denied.")
 }
 
 func (sm *SessionManager) handlePermissionCommand(agent *Agent, msg channels.InboundMessage, args []string) {
@@ -835,7 +845,7 @@ func (sm *SessionManager) handlePermissionCommand(agent *Agent, msg channels.Inb
 	switch mode {
 	case "default", "plan", "bypassPermissions", "auto":
 		session.setPermissionMode(mode)
-		sm.reply(msg, "Permission mode set to: "+mode)
+		sm.reply(msg, "Permission mode set to: "+mode+". Use /reset to apply to running session.")
 	default:
 		sm.reply(msg, "Invalid permission mode: "+mode+"\nValid modes: default, plan, bypassPermissions, auto")
 	}
@@ -1100,9 +1110,9 @@ func (sm *SessionManager) handleAgentCommand(user *UserState, msg channels.Inbou
 				} else {
 					_ = sm.syncAgentSessions(agent)
 				}
-				if agentType := agent.defaultType(); agentType != AgentTypeShell {
-					if err := LaunchAgentInTerminal(sm.cmux, agent.workspaceID(), session.SurfaceID, agentType); err != nil {
-						log.Printf("[session] failed to launch %s for new agent %s: %v", agentType, name, err)
+				if session.agentType() != AgentTypeShell {
+					if err := LaunchAgentInTerminal(sm.cmux, agent.workspaceID(), session.SurfaceID, session, sm.aiCfg); err != nil {
+						log.Printf("[session] failed to launch agent for new agent %s: %v", name, err)
 					}
 				}
 			}
@@ -1272,6 +1282,33 @@ Plain text goes to the active AI session. In shell sessions, plain text runs in 
 	help += "\n\nProvider notes:\n/think, /fast, /permission, /approve currently apply to Claude sessions only.\nUse /model for provider-specific Codex tuning."
 
 	sm.reply(msg, help)
+}
+
+// handleStreamEvent processes a parsed stream event and updates session state accordingly.
+// It is called by the presenter callback and by output_watcher for AI-mode sessions.
+func (sm *SessionManager) handleStreamEvent(session *Session, event StreamEvent) {
+	switch event.Type {
+	case StreamEventControlRequest:
+		session.setPendingApproval(event.Content)
+		// Presenter already notified IM via HandleEvent
+	case StreamEventResult:
+		if id, ok := event.Meta["session_id"].(string); ok && id != "" {
+			session.setProviderSessionID(id)
+		}
+		if usage, ok := event.Meta["usage"].(map[string]interface{}); ok {
+			snap := UsageSnapshot{Provider: event.Provider}
+			if v, ok := usage["input_tokens"].(float64); ok {
+				snap.InputTokens = int(v)
+			}
+			if v, ok := usage["cache_read_input_tokens"].(float64); ok {
+				snap.CachedInputTokens = int(v)
+			}
+			if v, ok := usage["output_tokens"].(float64); ok {
+				snap.OutputTokens = int(v)
+			}
+			session.setLastUsage(snap)
+		}
+	}
 }
 
 func (sm *SessionManager) teardownAgent(agent *Agent) {

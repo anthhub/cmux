@@ -27,6 +27,11 @@ type IMPresenter struct {
 	chatID      string
 	verbose     bool
 
+	// onControlRequest is called (without the presenter lock held) when a
+	// control_request event is received. The caller can use this to update
+	// session state (e.g., setPendingApproval).
+	onControlRequest func(event StreamEvent)
+
 	mu            sync.Mutex
 	buffer        strings.Builder
 	parts         []presentedPart
@@ -78,9 +83,16 @@ func (p *IMPresenter) HandleEvent(event StreamEvent) {
 	case StreamEventControlRequest:
 		message := strings.TrimSpace(event.Content)
 		if message == "" {
-			message = "Approval required. Reply with /approve once supported."
+			message = "Approval required. Use /approve or /deny."
 		}
 		p.sendStandaloneLocked(message)
+		// Invoke callback outside the lock to avoid deadlock
+		cb := p.onControlRequest
+		if cb != nil {
+			p.mu.Unlock()
+			cb(event)
+			p.mu.Lock()
+		}
 	case StreamEventError:
 		if strings.TrimSpace(event.Content) != "" {
 			p.sendStandaloneLocked("Error: " + strings.TrimSpace(event.Content))

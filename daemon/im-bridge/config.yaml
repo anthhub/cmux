@@ -22,8 +22,12 @@ slack:
 
 feishu:
   enabled: false
-  app_id: ""
-  app_secret: ""
+  app_id: "" # set via FEISHU_APP_ID env var or here
+  app_secret: "" # set via FEISHU_APP_SECRET env var or here
+
+discord:
+  enabled: false
+  bot_token: "" # set via DISCORD_BOT_TOKEN env var or here
 
 security:
   allowed_users: [] # empty = allow all; add user IDs to restrict

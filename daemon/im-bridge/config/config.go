@@ -13,6 +13,7 @@ type Config struct {
 	Telegram TelegramConfig `yaml:"telegram"`
 	Slack    SlackConfig    `yaml:"slack"`
 	Feishu   FeishuConfig   `yaml:"feishu"`
+	Discord  DiscordConfig  `yaml:"discord"`
 	Security SecurityConfig `yaml:"security"`
 }
 
@@ -53,6 +54,12 @@ type FeishuConfig struct {
 	AppSecret string `yaml:"app_secret"`
 }
 
+// DiscordConfig configures the Discord bot.
+type DiscordConfig struct {
+	Enabled  bool   `yaml:"enabled"`
+	BotToken string `yaml:"bot_token"`
+}
+
 // SecurityConfig configures access control.
 type SecurityConfig struct {
 	AllowedUsers []string `yaml:"allowed_users"` // whitelist of IM user IDs
@@ -87,8 +94,44 @@ func Load(path string) (*Config, error) {
 	if value := os.Getenv("CMUX_IM_BRIDGE_CODEX_PATH"); value != "" {
 		cfg.AI.CodexPath = value
 	}
+	if value := os.Getenv("SLACK_BOT_TOKEN"); value != "" {
+		cfg.Slack.BotToken = value
+		cfg.Slack.Enabled = true
+	}
+	if value := os.Getenv("SLACK_APP_TOKEN"); value != "" {
+		cfg.Slack.AppToken = value
+	}
+	if value := os.Getenv("FEISHU_APP_ID"); value != "" {
+		cfg.Feishu.AppID = value
+		cfg.Feishu.Enabled = true
+	}
+	if value := os.Getenv("FEISHU_APP_SECRET"); value != "" {
+		cfg.Feishu.AppSecret = value
+	}
+	if value := os.Getenv("DISCORD_BOT_TOKEN"); value != "" {
+		cfg.Discord.BotToken = value
+		cfg.Discord.Enabled = true
+	}
 
 	return &cfg, nil
+}
+
+// EnabledChannels returns the names of all channels that are enabled in the config.
+func (c *Config) EnabledChannels() []string {
+	var names []string
+	if c.Telegram.Enabled {
+		names = append(names, "telegram")
+	}
+	if c.Slack.Enabled {
+		names = append(names, "slack")
+	}
+	if c.Feishu.Enabled {
+		names = append(names, "feishu")
+	}
+	if c.Discord.Enabled {
+		names = append(names, "discord")
+	}
+	return names
 }
 
 // IsUserAllowed checks if a user ID is in the whitelist.

@@ -13,8 +13,24 @@ import (
 	tele "gopkg.in/telebot.v4"
 )
 
+func init() {
+	RegisterFactory("telegram", func(cfg interface{}) (Channel, error) {
+		tc, ok := cfg.(*telegramFactoryCfg)
+		if !ok {
+			return nil, fmt.Errorf("telegram factory: expected *telegramFactoryCfg, got %T", cfg)
+		}
+		return NewTelegramChannel(tc.BotToken)
+	})
+}
+
+// telegramFactoryCfg is the config type passed to the telegram factory.
+type telegramFactoryCfg struct {
+	BotToken string
+}
+
 // TelegramChannel implements Channel for Telegram.
 type TelegramChannel struct {
+	*BaseChannel
 	bot     *tele.Bot
 	handler func(msg InboundMessage)
 }
@@ -31,7 +47,10 @@ func NewTelegramChannel(token string) (*TelegramChannel, error) {
 		return nil, fmt.Errorf("failed to create telegram bot: %w", err)
 	}
 
-	tc := &TelegramChannel{bot: bot}
+	tc := &TelegramChannel{
+		BaseChannel: NewBaseChannel("telegram", 4096, nil),
+		bot:         bot,
+	}
 
 	// Handle all text messages
 	bot.Handle(tele.OnText, func(c tele.Context) error {
@@ -50,17 +69,15 @@ func NewTelegramChannel(token string) (*TelegramChannel, error) {
 	return tc, nil
 }
 
-func (tc *TelegramChannel) Name() string {
-	return "telegram"
-}
-
 func (tc *TelegramChannel) Start(_ context.Context) error {
 	log.Printf("[telegram] bot @%s starting", tc.bot.Me.Username)
+	tc.SetRunning(true)
 	go tc.bot.Start()
 	return nil
 }
 
 func (tc *TelegramChannel) Stop() error {
+	tc.SetRunning(false)
 	tc.bot.Stop()
 	return nil
 }
@@ -138,10 +155,6 @@ func (tc *TelegramChannel) SendTyping(chatID string) (func(), error) {
 	return func() {
 		once.Do(func() { close(stopCh) })
 	}, nil
-}
-
-func (tc *TelegramChannel) MaxMessageLength() int {
-	return 4096
 }
 
 func (tc *TelegramChannel) send(chatID string, msg OutboundMessage) (*tele.Message, error) {
