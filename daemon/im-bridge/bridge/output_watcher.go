@@ -206,6 +206,7 @@ func cleanTerminalOutput(text string) string {
 	cleaned := stripANSI(text)
 	cleaned = stripBoxChars(cleaned)
 	cleaned = stripSpinner(cleaned)
+	cleaned = stripClaudeTUI(cleaned)
 	cleaned = stripPrompt(cleaned)
 	cleaned = compressBlankLines(cleaned)
 	return strings.TrimSpace(cleaned)
@@ -308,6 +309,77 @@ func isSpinnerLine(line string) bool {
 		return true
 	}
 	return false
+}
+
+// isClaudeTUILine returns true if the line is part of Claude Code's TUI chrome.
+// Uses simple string matching (case-insensitive) to be robust against ANSI artifacts.
+func isClaudeTUILine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+
+	// Claude Code header
+	if strings.Contains(lower, "claude code v") {
+		return true
+	}
+	// Model info lines: "Opus 4.6 (1M context)"
+	if (strings.Contains(lower, "opus") || strings.Contains(lower, "sonnet") || strings.Contains(lower, "haiku")) &&
+		strings.Contains(lower, "context") {
+		return true
+	}
+	// Status bar with MCPs/hooks/CLAUDE.md
+	if strings.Contains(lower, "mcps") || strings.Contains(lower, "hooks") {
+		if strings.Contains(trimmed, "|") {
+			return true
+		}
+	}
+	if strings.Contains(lower, "claude.md") && strings.Contains(trimmed, "|") {
+		return true
+	}
+	// Navigation hints
+	if strings.Contains(lower, "press ctrl-c") || strings.Contains(lower, "press ctrl+c") {
+		return true
+	}
+	if strings.Contains(lower, "ctrl+g to edit") || strings.Contains(lower, "ctrl-g to edit") {
+		return true
+	}
+	// Progress bar: 3+ block elements
+	blockCount := 0
+	for _, r := range trimmed {
+		if r >= 0x2580 && r <= 0x259F { // Block Elements Unicode range
+			blockCount++
+			if blockCount >= 3 {
+				return true
+			}
+		} else {
+			blockCount = 0
+		}
+	}
+	// Bare prompt markers (❯ followed by just "claude" or nothing)
+	stripped := strings.TrimLeft(trimmed, "❯❮>$ ")
+	stripped = strings.TrimSpace(stripped)
+	if stripped == "" || stripped == "claude" || stripped == "codex" {
+		return true
+	}
+	// Path-only lines: just "/Users/xxx"
+	if strings.HasPrefix(trimmed, "/Users/") && !strings.Contains(trimmed, " ") {
+		return true
+	}
+	return false
+}
+
+// stripClaudeTUI removes Claude Code TUI chrome lines from output.
+func stripClaudeTUI(s string) string {
+	lines := strings.Split(s, "\n")
+	var result []string
+	for _, line := range lines {
+		if !isClaudeTUILine(line) {
+			result = append(result, line)
+		}
+	}
+	return strings.Join(result, "\n")
 }
 
 // promptRe matches common shell prompts: optional (env) prefix, user@host path % or $

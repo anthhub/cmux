@@ -91,9 +91,11 @@ type SessionManager struct {
 // NewSessionManager creates a new session manager.
 func NewSessionManager(ctx context.Context, cmux *CmuxClient, channel *channels.Manager, ai config.AIConfig) *SessionManager {
 	defaultType := normalizeAgentType(ai.DefaultAgent)
+	log.Printf("[session] config default_agent=%q normalized=%q", ai.DefaultAgent, defaultType)
 	if defaultType == "" {
 		defaultType = AgentTypeClaude
 	}
+	log.Printf("[session] using defaultAgentType=%q", defaultType)
 
 	return &SessionManager{
 		ctx:              ctx,
@@ -1319,12 +1321,21 @@ func (sm *SessionManager) teardownAgent(agent *Agent) {
 }
 
 func (sm *SessionManager) sendWelcome(msg channels.InboundMessage) {
+	modeName := sm.defaultAgentType
+	switch modeName {
+	case AgentTypeClaude:
+		modeName = "Claude Code"
+	case AgentTypeCodex:
+		modeName = "Codex"
+	case AgentTypeShell:
+		modeName = "Shell"
+	}
 	sm.reply(msg, "👋 欢迎使用 cmux 终端助手！\n\n"+
 		"直接输入问题或指令，我会帮你完成。\n"+
 		"• ! command — 直接执行 shell 命令\n"+
 		"• /help — 查看所有命令\n"+
 		"• /new name --model shell — 创建 shell 会话\n\n"+
-		"当前模式：Claude Code")
+		"当前模式："+modeName)
 }
 
 func (sm *SessionManager) send(channelName, chatID string, msg channels.OutboundMessage) {

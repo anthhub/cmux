@@ -10,22 +10,18 @@ import (
 	"sync"
 	"time"
 
+	"github.com/manaflow-ai/cmux/daemon/im-bridge/config"
 	tele "gopkg.in/telebot.v4"
 )
 
 func init() {
 	RegisterFactory("telegram", func(cfg interface{}) (Channel, error) {
-		tc, ok := cfg.(*telegramFactoryCfg)
+		tc, ok := cfg.(*config.TelegramConfig)
 		if !ok {
-			return nil, fmt.Errorf("telegram factory: expected *telegramFactoryCfg, got %T", cfg)
+			return nil, fmt.Errorf("telegram factory: expected *config.TelegramConfig, got %T", cfg)
 		}
 		return NewTelegramChannel(tc.BotToken)
 	})
-}
-
-// telegramFactoryCfg is the config type passed to the telegram factory.
-type telegramFactoryCfg struct {
-	BotToken string
 }
 
 // TelegramChannel implements Channel for Telegram.

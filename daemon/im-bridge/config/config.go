@@ -14,6 +14,7 @@ type Config struct {
 	Slack    SlackConfig    `yaml:"slack"`
 	Feishu   FeishuConfig   `yaml:"feishu"`
 	Discord  DiscordConfig  `yaml:"discord"`
+	WeChat   WeChatConfig   `yaml:"wechat"`
 	Security SecurityConfig `yaml:"security"`
 }
 
@@ -58,6 +59,13 @@ type FeishuConfig struct {
 type DiscordConfig struct {
 	Enabled  bool   `yaml:"enabled"`
 	BotToken string `yaml:"bot_token"`
+}
+
+// WeChatConfig configures the WeChat bot.
+type WeChatConfig struct {
+	Enabled        bool   `yaml:"enabled"`
+	BotToken       string `yaml:"bot_token"`       // iLink bot token（从 QR 登录获取）
+	CredentialsDir string `yaml:"credentials_dir"` // 凭证保存目录，默认 ~/.weclaw/accounts
 }
 
 // SecurityConfig configures access control.
@@ -112,6 +120,9 @@ func Load(path string) (*Config, error) {
 		cfg.Discord.BotToken = value
 		cfg.Discord.Enabled = true
 	}
+	if token := os.Getenv("WECHAT_BOT_TOKEN"); token != "" {
+		cfg.WeChat.BotToken = token
+	}
 
 	return &cfg, nil
 }
@@ -130,6 +141,9 @@ func (c *Config) EnabledChannels() []string {
 	}
 	if c.Discord.Enabled {
 		names = append(names, "discord")
+	}
+	if c.WeChat.Enabled {
+		names = append(names, "wechat")
 	}
 	return names
 }

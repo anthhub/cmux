@@ -29,5 +29,10 @@ discord:
   enabled: false
   bot_token: "" # set via DISCORD_BOT_TOKEN env var or here
 
+wechat:
+  enabled: false
+  bot_token: "" # set via WECHAT_BOT_TOKEN env var or QR code login
+  credentials_dir: "" # default: ~/.weclaw/accounts
+
 security:
   allowed_users: [] # empty = allow all; add user IDs to restrict

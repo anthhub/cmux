@@ -61,6 +61,7 @@ func main() {
 		"slack":    &cfg.Slack,
 		"feishu":   &cfg.Feishu,
 		// TODO: add "discord": &cfg.Discord when DiscordConfig is added to config.Config
+		"wechat":   &cfg.WeChat,
 	}
 
 	// Determine which channels are enabled via config flags.
@@ -73,6 +74,9 @@ func main() {
 	}
 	if cfg.Feishu.Enabled {
 		enabledChannels = append(enabledChannels, "feishu")
+	}
+	if cfg.WeChat.Enabled {
+		enabledChannels = append(enabledChannels, "wechat")
 	}
 	// TODO: add Discord when DiscordConfig is wired into config.Config
 
