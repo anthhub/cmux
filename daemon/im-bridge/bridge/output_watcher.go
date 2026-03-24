@@ -3,8 +3,10 @@ package bridge
 import (
 	"context"
 	"log"
+	"regexp"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -158,20 +160,142 @@ func extractNewLines(lastOutput, currentOutput string) string {
 	return strings.Join(currentLines, "\n")
 }
 
-// cleanTerminalOutput strips ANSI codes, removes empty lines, and trims.
+// cleanTerminalOutput strips ANSI codes, box drawing chars, spinners, prompts, and compresses blanks.
 func cleanTerminalOutput(text string) string {
 	cleaned := stripANSI(text)
-	cleaned = strings.TrimSpace(cleaned)
-
-	// Remove excessive blank lines
-	for strings.Contains(cleaned, "\n\n\n") {
-		cleaned = strings.ReplaceAll(cleaned, "\n\n\n", "\n\n")
-	}
-
-	return cleaned
+	cleaned = stripBoxChars(cleaned)
+	cleaned = stripSpinner(cleaned)
+	cleaned = stripPrompt(cleaned)
+	cleaned = compressBlankLines(cleaned)
+	return strings.TrimSpace(cleaned)
 }
 
-// stripANSI removes ANSI escape sequences from text.
+// compressBlankLines collapses 3+ consecutive blank lines into 1, and trims leading/trailing blank lines.
+func compressBlankLines(s string) string {
+	lines := strings.Split(s, "\n")
+
+	// Trim leading blank lines
+	start := 0
+	for start < len(lines) && strings.TrimSpace(lines[start]) == "" {
+		start++
+	}
+	// Trim trailing blank lines
+	end := len(lines)
+	for end > start && strings.TrimSpace(lines[end-1]) == "" {
+		end--
+	}
+	if start >= end {
+		return ""
+	}
+	lines = lines[start:end]
+
+	// Compress 3+ consecutive blank lines to 1
+	var result []string
+	blankCount := 0
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			blankCount++
+			if blankCount <= 1 {
+				result = append(result, line)
+			}
+		} else {
+			blankCount = 0
+			result = append(result, line)
+		}
+	}
+	return strings.Join(result, "\n")
+}
+
+// stripBoxChars removes Unicode box drawing characters (U+2500-U+257F) and their thick/dashed variants.
+func stripBoxChars(s string) string {
+	var result strings.Builder
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if isBoxDrawing(r) {
+			i += size
+			continue
+		}
+		result.WriteRune(r)
+		i += size
+	}
+	return result.String()
+}
+
+func isBoxDrawing(r rune) bool {
+	// U+2500-U+257F: Box Drawing block
+	return r >= 0x2500 && r <= 0x257F
+}
+
+// stripSpinner removes spinner/progress indicator lines from Claude Code TUI output.
+func stripSpinner(s string) string {
+	lines := strings.Split(s, "\n")
+	var result []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if isSpinnerLine(trimmed) {
+			continue
+		}
+		result = append(result, line)
+	}
+	return strings.Join(result, "\n")
+}
+
+var spinnerRunes = map[rune]bool{
+	'⏺': true, '⏳': true,
+	'⠋': true, '⠙': true, '⠹': true, '⠸': true,
+	'⠼': true, '⠴': true, '⠦': true, '⠧': true,
+	'⠇': true, '⠏': true,
+	'✻': true,
+}
+
+func isSpinnerLine(line string) bool {
+	if line == "" {
+		return false
+	}
+	// Lines that start with a spinner rune
+	r, _ := utf8.DecodeRuneInString(line)
+	if spinnerRunes[r] {
+		return true
+	}
+	// Status-only lines
+	lower := strings.ToLower(line)
+	if lower == "working..." || lower == "thinking..." {
+		return true
+	}
+	// "Baked for" / "Cooked for" / "Crunched for" lines
+	if strings.HasPrefix(lower, "baked for") || strings.HasPrefix(lower, "cooked for") || strings.HasPrefix(lower, "crunched for") {
+		return true
+	}
+	return false
+}
+
+// promptRe matches common shell prompts: optional (env) prefix, user@host path % or $
+var promptRe = regexp.MustCompile(`^(?:\([^)]+\)\s+)?[\w.-]+@[\w.-]+\s+[^\s]+\s+[%$]\s*$`)
+
+// promptCmdRe matches a prompt followed by a command — we keep the command part
+var promptCmdRe = regexp.MustCompile(`^(?:\([^)]+\)\s+)?[\w.-]+@[\w.-]+\s+[^\s]+\s+[%$]\s+(.+)$`)
+
+// stripPrompt removes shell prompt lines. If a prompt is followed by a command, the command is kept.
+func stripPrompt(s string) string {
+	lines := strings.Split(s, "\n")
+	var result []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if promptRe.MatchString(trimmed) {
+			// Pure prompt with no command — skip
+			continue
+		}
+		if m := promptCmdRe.FindStringSubmatch(trimmed); m != nil {
+			// Prompt followed by command — keep the command
+			result = append(result, m[1])
+			continue
+		}
+		result = append(result, line)
+	}
+	return strings.Join(result, "\n")
+}
+
+// stripANSI removes ANSI escape sequences and non-printable control characters from text.
 func stripANSI(s string) string {
 	var result strings.Builder
 	inEscape := false
@@ -191,6 +315,13 @@ func stripANSI(s string) string {
 			continue
 		}
 
+		// Handle 8-bit CSI (U+009B)
+		if r == 0x9B {
+			inEscape = true
+			i += size
+			continue
+		}
+
 		// In OSC sequence, skip until BEL or ST
 		if inOSC {
 			if r == '\a' || (r == '\\' && i > 0 && s[i-1] == '\x1b') {
@@ -201,17 +332,29 @@ func stripANSI(s string) string {
 			continue
 		}
 
-		// In CSI escape sequence, skip until letter
+		// In CSI escape sequence, skip until final byte
 		if inEscape {
-			if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || r == '~' {
+			if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || r == '~' || r == '@' {
 				inEscape = false
 			}
 			i += size
 			continue
 		}
 
-		// Skip other control characters except newline/tab
+		// Skip C0 control characters except newline/tab
 		if r < 32 && r != '\n' && r != '\t' {
+			i += size
+			continue
+		}
+
+		// Skip C1 control characters (U+0080-U+009F)
+		if r >= 0x80 && r <= 0x9F {
+			i += size
+			continue
+		}
+
+		// Skip other Unicode control characters (except common whitespace)
+		if unicode.IsControl(r) && r != '\n' && r != '\t' {
 			i += size
 			continue
 		}

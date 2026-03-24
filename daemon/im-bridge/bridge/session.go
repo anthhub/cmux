@@ -5,14 +5,12 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/manaflow-ai/cmux/daemon/im-bridge/channels"
 	"github.com/manaflow-ai/cmux/daemon/im-bridge/config"
@@ -50,6 +48,8 @@ type Agent struct {
 	SessionOrder []string
 	ActiveSID    string
 	mu           sync.RWMutex
+
+	workspaceEnsureMu sync.Mutex
 }
 
 // Session represents one IM conversation mapped to a cmux surface.
@@ -82,7 +82,7 @@ type SessionManager struct {
 	users            map[string]*UserState
 	cmux             *CmuxClient
 	channel          *channels.Manager
-	runner           *AgentRunner
+	aiCfg            config.AIConfig
 	defaultAgentType string
 	mu               sync.RWMutex
 }
@@ -99,7 +99,7 @@ func NewSessionManager(ctx context.Context, cmux *CmuxClient, channel *channels.
 		users:            make(map[string]*UserState),
 		cmux:             cmux,
 		channel:          channel,
-		runner:           NewAgentRunner(ai),
+		aiCfg:            ai,
 		defaultAgentType: defaultType,
 	}
 }
@@ -112,11 +112,16 @@ func (sm *SessionManager) HandleMessage(msg channels.InboundMessage) {
 	}
 
 	user := sm.getOrCreateUser(msg.UserID)
+	isNewUser := user.activeAgent() == nil
 	agent, err := sm.ensureActiveAgent(user)
 	if err != nil {
 		log.Printf("[session] failed to ensure active agent for %s: %v", msg.UserID, err)
 		sm.reply(msg, "Error: "+err.Error())
 		return
+	}
+
+	if isNewUser {
+		sm.sendWelcome(msg)
 	}
 
 	if strings.HasPrefix(text, "!") {
@@ -246,6 +251,11 @@ func (sm *SessionManager) ensureActiveAgent(user *UserState) (*Agent, error) {
 			} else if err := sm.syncAgentSessions(agent); err != nil {
 				return nil, err
 			}
+			if agentType := agent.defaultType(); agentType != AgentTypeShell {
+				if err := LaunchAgentInTerminal(sm.cmux, agent.workspaceID(), session.SurfaceID, agentType); err != nil {
+					log.Printf("[session] failed to launch %s in terminal for agent %s: %v", agentType, agent.Name, err)
+				}
+			}
 		}
 	}
 
@@ -253,23 +263,33 @@ func (sm *SessionManager) ensureActiveAgent(user *UserState) (*Agent, error) {
 }
 
 func (sm *SessionManager) ensureAgentWorkspace(userID string, agent *Agent) (bool, error) {
+	agent.workspaceEnsureMu.Lock()
+	defer agent.workspaceEnsureMu.Unlock()
+
 	title := workspaceTitle(userID, agent.Name)
-	workspaces, err := sm.cmux.ListWorkspaces()
+	listings, err := sm.cmux.ListAllWorkspaces()
 	if err != nil {
-		return false, fmt.Errorf("list workspaces for agent %q: %w", agent.Name, err)
+		workspaces, fallbackErr := sm.cmux.ListWorkspaces()
+		if fallbackErr != nil {
+			return false, fmt.Errorf("list workspaces for agent %q: %w", agent.Name, err)
+		}
+		listings = make([]WorkspaceListing, 0, len(workspaces))
+		for _, workspace := range workspaces {
+			listings = append(listings, WorkspaceListing{Workspace: workspace})
+		}
 	}
 
 	if workspaceID := agent.workspaceID(); workspaceID != "" {
-		for _, workspace := range workspaces {
-			if workspace.ID == workspaceID {
+		for _, listing := range listings {
+			if listing.Workspace.ID == workspaceID {
 				return false, nil
 			}
 		}
 	}
 
-	for _, workspace := range workspaces {
-		if strings.TrimSpace(workspace.Title) == strings.TrimSpace(title) {
-			agent.setWorkspaceID(workspace.ID)
+	for _, listing := range listings {
+		if strings.TrimSpace(listing.Workspace.Title) == strings.TrimSpace(title) {
+			agent.setWorkspaceID(listing.Workspace.ID)
 			return false, nil
 		}
 	}
@@ -375,10 +395,16 @@ func (sm *SessionManager) handleNewSession(agent *Agent, msg channels.InboundMes
 		return
 	}
 	agent.setActiveSession(surface.ID)
+	sessionType := effectiveAgentType(provider, agent.defaultType())
 	if session := agent.ActiveSession(); session != nil {
-		session.setAgentType(effectiveAgentType(provider, agent.defaultType()))
+		session.setAgentType(sessionType)
+		if sessionType != AgentTypeShell {
+			if err := LaunchAgentInTerminal(sm.cmux, agent.workspaceID(), surface.ID, sessionType); err != nil {
+				log.Printf("[session] failed to launch %s in new session %s: %v", sessionType, name, err)
+			}
+		}
 	}
-	sm.reply(msg, fmt.Sprintf("New session [%s] created (%s)", name, agent.ActiveSession().agentType()))
+	sm.reply(msg, fmt.Sprintf("New session [%s] created (%s)", name, sessionType))
 }
 
 func (sm *SessionManager) handleListSessions(agent *Agent, msg channels.InboundMessage) {
@@ -445,10 +471,8 @@ func (sm *SessionManager) handleCloseSession(agent *Agent, msg channels.InboundM
 		return
 	}
 
-	if session.isRunningTurn() {
-		_ = sm.runner.StopTurn(session.ID)
-	}
 	session.stopWatching()
+	_ = StopAgent(sm.cmux, agent.workspaceID(), session.SurfaceID)
 	if err := sm.cmux.CloseSurface(agent.workspaceID(), session.SurfaceID); err != nil {
 		sm.reply(msg, "Error closing session: "+err.Error())
 		return
@@ -492,8 +516,13 @@ func (sm *SessionManager) handleResetSession(agent *Agent, msg channels.InboundM
 		sm.reply(msg, "No active session to reset")
 		return
 	}
-	if session.isRunningTurn() {
-		_ = sm.runner.StopTurn(session.ID)
+	session.stopWatching()
+	// Send Ctrl+C to stop any running process, then relaunch the agent
+	_ = StopAgent(sm.cmux, agent.workspaceID(), session.SurfaceID)
+	if agentType := session.agentType(); agentType != AgentTypeShell {
+		if err := LaunchAgentInTerminal(sm.cmux, agent.workspaceID(), session.SurfaceID, agentType); err != nil {
+			log.Printf("[session] failed to relaunch %s after reset: %v", agentType, err)
+		}
 	}
 	session.setProviderSessionID("")
 	session.setPendingApproval("")
@@ -531,6 +560,10 @@ func (sm *SessionManager) handleThinkCommand(agent *Agent, msg channels.InboundM
 		sm.reply(msg, "No active session")
 		return
 	}
+	if session.agentType() != AgentTypeClaude {
+		sm.reply(msg, "Thinking effort is currently supported only for Claude sessions. Use /model for Codex tuning.")
+		return
+	}
 	if len(args) == 0 {
 		value := session.effort()
 		if value == "" {
@@ -557,6 +590,10 @@ func (sm *SessionManager) handleFastCommand(agent *Agent, msg channels.InboundMe
 	session := agent.ActiveSession()
 	if session == nil {
 		sm.reply(msg, "No active session")
+		return
+	}
+	if session.agentType() != AgentTypeClaude {
+		sm.reply(msg, "Fast mode currently maps to Claude presets only. Use /model for Codex sessions.")
 		return
 	}
 	if len(args) == 0 {
@@ -673,72 +710,20 @@ func (sm *SessionManager) handleAIInput(agent *Agent, session *Session, msg chan
 		sm.reply(msg, "The active session is not a terminal. Switch to a terminal session before sending AI prompts.")
 		return
 	}
-	if !session.startTurn() {
-		sm.reply(msg, "A turn is already running in this session. Use /stop to interrupt it.")
+
+	// Same as handleBash: send text to terminal and watch output
+	session.stopWatching()
+	baseline, _ := sm.cmux.ReadText(agent.workspaceID(), session.SurfaceID)
+	session.setLastOutput(baseline)
+
+	ctx, cancel := context.WithCancel(sm.ctx)
+	session.setWatchCancel(cancel)
+	go sm.watchOutput(ctx, agent.workspaceID(), session, msg.ChannelName, msg.ChatID)
+
+	if err := sm.cmux.SendText(agent.workspaceID(), session.SurfaceID, prompt+"\n"); err != nil {
+		session.stopWatching()
+		sm.reply(msg, "Error sending to terminal: "+err.Error())
 		return
-	}
-	defer session.finishTurn()
-
-	session.setPendingApproval("")
-	sm.appendTranscript(agent, session, "User", prompt)
-
-	turnCtx, turnCancel := context.WithTimeout(sm.ctx, 5*time.Minute)
-	defer turnCancel()
-
-	turn, err := sm.runner.StartTurn(turnCtx, session, prompt)
-	if err != nil {
-		sm.reply(msg, "Error starting AI turn: "+err.Error())
-		return
-	}
-
-	presenter := NewIMPresenter(sm.channel, msg.ChannelName, msg.ChatID, session.verbose())
-	var assistant strings.Builder
-	sawDelta := false
-
-	for event := range turn.Events {
-		switch event.Type {
-		case StreamEventText:
-			if event.Delta {
-				sawDelta = true
-				assistant.WriteString(event.Content)
-			} else if !sawDelta && strings.TrimSpace(event.Content) != "" {
-				assistant.Reset()
-				assistant.WriteString(event.Content)
-			}
-		case StreamEventResult:
-			session.setLastUsage(usageFromEvent(event))
-			if assistant.Len() == 0 && strings.TrimSpace(event.Content) != "" {
-				assistant.WriteString(event.Content)
-			}
-		case StreamEventError:
-			log.Printf("[session] AI error in %s/%s: %s", agent.Name, session.Name, event.Content)
-		case StreamEventControlRequest:
-			session.setPendingApproval(event.Content)
-			perm := session.permissionMode()
-			if perm == "" {
-				perm = sm.runner.cfg.ClaudePermissionMode
-			}
-			if perm == "" {
-				perm = "(not set)"
-			}
-			sm.reply(msg, fmt.Sprintf(
-				"Tool approval requested: %s\n"+
-					"Current permission mode: %s\n"+
-					"Use /permission <mode> to change how approvals are handled on the next turn.",
-				event.Content, perm,
-			))
-		}
-		presenter.HandleEvent(event)
-	}
-	presenter.Close()
-
-	waitErr := <-turn.Done
-	if waitErr != nil && !errors.Is(waitErr, context.Canceled) {
-		log.Printf("[session] AI turn failed for %s/%s: %v", agent.Name, session.Name, waitErr)
-	}
-
-	if text := strings.TrimSpace(assistant.String()); text != "" {
-		sm.appendTranscript(agent, session, "Assistant", text)
 	}
 }
 
@@ -781,29 +766,22 @@ func (sm *SessionManager) handleStop(agent *Agent, msg channels.InboundMessage) 
 		return
 	}
 
-	stopped := false
-	if session.isRunningTurn() {
-		if err := sm.runner.StopTurn(session.ID); err == nil {
-			stopped = true
-		}
-	}
-	if session.isWatching() || session.SurfaceType == "terminal" {
-		session.stopWatching()
-		_ = sm.cmux.SendKey(agent.workspaceID(), session.SurfaceID, "ctrl+c")
-		stopped = true
-	}
-
-	if stopped {
-		sm.reply(msg, "Stop signal sent.")
+	session.stopWatching()
+	if err := StopAgent(sm.cmux, agent.workspaceID(), session.SurfaceID); err != nil {
+		sm.reply(msg, "Error sending stop signal: "+err.Error())
 		return
 	}
-	sm.reply(msg, "Nothing is currently running.")
+	sm.reply(msg, "Stop signal sent.")
 }
 
 func (sm *SessionManager) handleApprove(agent *Agent, msg channels.InboundMessage) {
 	session := agent.ActiveSession()
 	if session == nil {
 		sm.reply(msg, "No active session")
+		return
+	}
+	if session.agentType() != AgentTypeClaude {
+		sm.reply(msg, "Interactive /approve is currently only surfaced for Claude sessions.")
 		return
 	}
 	pending := strings.TrimSpace(session.pendingApproval())
@@ -814,18 +792,17 @@ func (sm *SessionManager) handleApprove(agent *Agent, msg channels.InboundMessag
 
 	perm := session.permissionMode()
 	if perm == "" {
-		perm = sm.runner.cfg.ClaudePermissionMode
+		perm = sm.aiCfg.ClaudePermissionMode
 	}
 	if perm == "" {
 		perm = "(not set)"
 	}
 
 	sm.reply(msg, fmt.Sprintf(
-		"Claude Code's -p mode does not support interactive approval via stdin.\n"+
-			"When a tool requires approval, it is handled by the --permission-mode setting.\n\n"+
+		"Claude Code runs interactively in the terminal.\n"+
+			"Use /permission <mode> to change how approvals are handled.\n\n"+
 			"Current permission mode: %s\n"+
 			"Pending request was: %s\n\n"+
-			"Use /permission <mode> to change the permission mode for the next turn.\n"+
 			"Valid modes: default, plan, bypassPermissions, auto",
 		perm, pending,
 	))
@@ -837,11 +814,15 @@ func (sm *SessionManager) handlePermissionCommand(agent *Agent, msg channels.Inb
 		sm.reply(msg, "No active session")
 		return
 	}
+	if session.agentType() != AgentTypeClaude {
+		sm.reply(msg, "Permission mode is currently supported only for Claude sessions.")
+		return
+	}
 
 	if len(args) == 0 {
 		perm := session.permissionMode()
 		if perm == "" {
-			perm = sm.runner.cfg.ClaudePermissionMode
+			perm = sm.aiCfg.ClaudePermissionMode
 		}
 		if perm == "" {
 			perm = "(not set — using provider default)"
@@ -1119,6 +1100,11 @@ func (sm *SessionManager) handleAgentCommand(user *UserState, msg channels.Inbou
 				} else {
 					_ = sm.syncAgentSessions(agent)
 				}
+				if agentType := agent.defaultType(); agentType != AgentTypeShell {
+					if err := LaunchAgentInTerminal(sm.cmux, agent.workspaceID(), session.SurfaceID, agentType); err != nil {
+						log.Printf("[session] failed to launch %s for new agent %s: %v", agentType, name, err)
+					}
+				}
 			}
 		}
 		if err := sm.cmux.SelectWorkspace(agent.workspaceID()); err != nil {
@@ -1283,29 +1269,25 @@ OpenClaw migration:
 
 Plain text goes to the active AI session. In shell sessions, plain text runs in the terminal.`
 
+	help += "\n\nProvider notes:\n/think, /fast, /permission, /approve currently apply to Claude sessions only.\nUse /model for provider-specific Codex tuning."
+
 	sm.reply(msg, help)
 }
 
 func (sm *SessionManager) teardownAgent(agent *Agent) {
 	for _, session := range agent.ListSessions() {
 		session.stopWatching()
-		if session.isRunningTurn() {
-			_ = sm.runner.StopTurn(session.ID)
-		}
+		_ = StopAgent(sm.cmux, agent.workspaceID(), session.SurfaceID)
 	}
 }
 
-func (sm *SessionManager) appendTranscript(agent *Agent, session *Session, role, text string) {
-	if session == nil || session.SurfaceType != "terminal" || strings.TrimSpace(text) == "" {
-		return
-	}
-
-	const delimiter = "__CMUX_IM_BRIDGE__"
-	body := fmt.Sprintf("[%s]\n%s\n", role, text)
-	command := fmt.Sprintf("cat <<'%s'\n%s%s\n", delimiter, body, delimiter)
-	if err := sm.cmux.SendText(agent.workspaceID(), session.SurfaceID, command); err != nil {
-		log.Printf("[session] failed to append transcript to surface %s: %v", session.SurfaceID, err)
-	}
+func (sm *SessionManager) sendWelcome(msg channels.InboundMessage) {
+	sm.reply(msg, "👋 欢迎使用 cmux 终端助手！\n\n"+
+		"直接输入问题或指令，我会帮你完成。\n"+
+		"• ! command — 直接执行 shell 命令\n"+
+		"• /help — 查看所有命令\n"+
+		"• /new name --model shell — 创建 shell 会话\n\n"+
+		"当前模式：Claude Code")
 }
 
 func (sm *SessionManager) send(channelName, chatID string, msg channels.OutboundMessage) {
@@ -1536,22 +1518,6 @@ func (s *Session) setLastOutput(text string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.LastOutput = text
-}
-
-func (s *Session) startTurn() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.runningTurn {
-		return false
-	}
-	s.runningTurn = true
-	return true
-}
-
-func (s *Session) finishTurn() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.runningTurn = false
 }
 
 func (s *Session) isRunningTurn() bool {
@@ -1799,37 +1765,6 @@ func effectiveAgentType(value, fallback string) string {
 		return normalized
 	}
 	return AgentTypeClaude
-}
-
-func usageFromEvent(event StreamEvent) UsageSnapshot {
-	usage := UsageSnapshot{Provider: event.Provider}
-	switch event.Provider {
-	case AgentTypeClaude:
-		raw, _ := event.Meta["usage"].(map[string]interface{})
-		usage.InputTokens = intFromMap(raw, "input_tokens")
-		usage.CachedInputTokens = intFromMap(raw, "cache_read_input_tokens")
-		usage.OutputTokens = intFromMap(raw, "output_tokens")
-	case AgentTypeCodex:
-		raw, _ := event.Meta["usage"].(map[string]interface{})
-		usage.InputTokens = intFromMap(raw, "input_tokens")
-		usage.CachedInputTokens = intFromMap(raw, "cached_input_tokens")
-		usage.OutputTokens = intFromMap(raw, "output_tokens")
-	}
-	return usage
-}
-
-func intFromMap(values map[string]interface{}, key string) int {
-	if values == nil {
-		return 0
-	}
-	switch value := values[key].(type) {
-	case float64:
-		return int(value)
-	case int:
-		return value
-	default:
-		return 0
-	}
 }
 
 func prettyJSON(raw []byte) string {

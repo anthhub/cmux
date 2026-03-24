@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -54,6 +55,18 @@ type WorkspaceInfo struct {
 	Selected bool   `json:"selected"`
 }
 
+// WindowInfo represents a cmux window.
+type WindowInfo struct {
+	ID                   string `json:"id"`
+	Ref                  string `json:"ref"`
+	Index                int    `json:"index"`
+	Key                  bool   `json:"key"`
+	Visible              bool   `json:"visible"`
+	WorkspaceCount       int    `json:"workspace_count"`
+	SelectedWorkspaceID  string `json:"selected_workspace_id"`
+	SelectedWorkspaceRef string `json:"selected_workspace_ref"`
+}
+
 // SurfaceInfo represents a cmux surface (terminal/browser panel).
 type SurfaceInfo struct {
 	ID      string `json:"id"`
@@ -78,8 +91,21 @@ type workspaceCreateResult struct {
 	WorkspaceRef string `json:"workspace_ref"`
 }
 
+type windowListResult struct {
+	Windows []WindowInfo `json:"windows"`
+}
+
 type workspaceListResult struct {
+	WindowID   string          `json:"window_id"`
+	WindowRef  string          `json:"window_ref"`
 	Workspaces []WorkspaceInfo `json:"workspaces"`
+}
+
+// WorkspaceListing ties a workspace to the window it was discovered in.
+type WorkspaceListing struct {
+	WindowID  string
+	WindowRef string
+	Workspace WorkspaceInfo
 }
 
 type surfaceCreateResult struct {
@@ -275,7 +301,16 @@ func (c *CmuxClient) CreateWorkspace(name string) (*WorkspaceInfo, error) {
 
 // ListWorkspaces returns all workspaces.
 func (c *CmuxClient) ListWorkspaces() ([]WorkspaceInfo, error) {
-	result, err := c.Call("workspace.list", nil)
+	return c.ListWorkspacesForWindow("")
+}
+
+// ListWorkspacesForWindow returns workspaces for a specific window.
+func (c *CmuxClient) ListWorkspacesForWindow(windowID string) ([]WorkspaceInfo, error) {
+	params := map[string]interface{}{}
+	if windowID != "" {
+		params["window_id"] = windowID
+	}
+	result, err := c.Call("workspace.list", params)
 	if err != nil {
 		return nil, err
 	}
@@ -284,6 +319,44 @@ func (c *CmuxClient) ListWorkspaces() ([]WorkspaceInfo, error) {
 		return nil, fmt.Errorf("failed to parse workspace.list response: %w", err)
 	}
 	return resp.Workspaces, nil
+}
+
+// ListWindows returns all windows and their selected workspace context.
+func (c *CmuxClient) ListWindows() ([]WindowInfo, error) {
+	result, err := c.Call("window.list", nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp windowListResult
+	if err := json.Unmarshal(result, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse window.list response: %w", err)
+	}
+	return resp.Windows, nil
+}
+
+// ListAllWorkspaces discovers workspaces across every window.
+func (c *CmuxClient) ListAllWorkspaces() ([]WorkspaceListing, error) {
+	windows, err := c.ListWindows()
+	if err != nil {
+		return nil, err
+	}
+
+	listings := make([]WorkspaceListing, 0)
+	for _, window := range windows {
+		workspaces, err := c.ListWorkspacesForWindow(window.ID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list workspaces for window %s: %w", window.ID, err)
+		}
+		for _, workspace := range workspaces {
+			listings = append(listings, WorkspaceListing{
+				WindowID:  window.ID,
+				WindowRef: window.Ref,
+				Workspace: workspace,
+			})
+		}
+	}
+
+	return listings, nil
 }
 
 // ListSurfaces returns surfaces in a workspace.
@@ -470,7 +543,13 @@ func (c *CmuxClient) RenameSurface(workspaceID, surfaceID, title string) error {
 		params["workspace_id"] = workspaceID
 	}
 	_, err := c.Call("tab.action", params)
-	return err
+	if err == nil || workspaceID == "" || !strings.Contains(err.Error(), "Tab not found") {
+		return err
+	}
+
+	delete(params, "workspace_id")
+	_, retryErr := c.Call("tab.action", params)
+	return retryErr
 }
 
 // BrowserScreenshot captures a browser surface.

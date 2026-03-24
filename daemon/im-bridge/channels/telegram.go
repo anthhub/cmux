@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -84,15 +85,17 @@ func (tc *TelegramChannel) EditStreaming(chatID, messageID string, msg OutboundM
 	}
 
 	opts := &tele.SendOptions{}
+	text := msg.Text
 	if msg.Format == "markdown" || msg.Format == "code" {
 		opts.ParseMode = tele.ModeMarkdownV2
+		text = escapeMarkdownV2(msg.Text)
 	}
 
 	stored := tele.StoredMessage{
 		MessageID: messageID,
 		ChatID:    chatIDInt,
 	}
-	_, err = tc.bot.Edit(stored, msg.Text, opts)
+	_, err = tc.bot.Edit(stored, text, opts)
 	if err != nil && opts.ParseMode != "" {
 		_, err = tc.bot.Edit(stored, msg.Text)
 	}
@@ -149,31 +152,44 @@ func (tc *TelegramChannel) send(chatID string, msg OutboundMessage) (*tele.Messa
 
 	chat := &tele.Chat{ID: id}
 
-	// Handle attachments (images)
-	if len(msg.Attachments) > 0 {
-		for _, att := range msg.Attachments {
-			if att.Type == "image" {
-				photo := &tele.Photo{
-					File:    tele.FromReader(bytesReader(att.Data)),
-					Caption: msg.Text,
-				}
-				sent, err := tc.bot.Send(chat, photo)
-				return sent, err
+	// Handle all attachments
+	for _, att := range msg.Attachments {
+		switch att.Type {
+		case "image":
+			photo := &tele.Photo{
+				File:    tele.FromReader(bytesReader(att.Data)),
+				Caption: msg.Text,
+			}
+			if _, err := tc.bot.Send(chat, photo); err != nil {
+				return nil, fmt.Errorf("send photo: %w", err)
+			}
+		case "file":
+			doc := &tele.Document{
+				File:     tele.FromReader(bytesReader(att.Data)),
+				FileName: att.Filename,
+				Caption:  msg.Text,
+			}
+			if _, err := tc.bot.Send(chat, doc); err != nil {
+				return nil, fmt.Errorf("send document: %w", err)
 			}
 		}
 	}
 
-	// Send text with appropriate parse mode
-	opts := &tele.SendOptions{}
-	if msg.Format == "markdown" || msg.Format == "code" {
-		opts.ParseMode = tele.ModeMarkdownV2
+	// Send text if present
+	if msg.Text == "" {
+		return nil, nil
 	}
 
-	// For code format, the text is already wrapped in ```
-	// For plain text, send as-is
-	sent, err := tc.bot.Send(chat, msg.Text, opts)
-	if err != nil {
-		// Retry without parse mode if markdown fails
+	opts := &tele.SendOptions{}
+	text := msg.Text
+	if msg.Format == "markdown" || msg.Format == "code" {
+		opts.ParseMode = tele.ModeMarkdownV2
+		text = escapeMarkdownV2(msg.Text)
+	}
+
+	sent, err := tc.bot.Send(chat, text, opts)
+	if err != nil && opts.ParseMode != "" {
+		// Fallback to plain text if escaped markdown still fails
 		sent, err = tc.bot.Send(chat, msg.Text)
 	}
 	return sent, err
@@ -181,6 +197,44 @@ func (tc *TelegramChannel) send(chatID string, msg OutboundMessage) (*tele.Messa
 
 func (tc *TelegramChannel) OnMessage(handler func(msg InboundMessage)) {
 	tc.handler = handler
+}
+
+// escapeMarkdownV2 escapes special characters for Telegram MarkdownV2 parse mode,
+// preserving content inside code blocks (``` and `) unchanged.
+func escapeMarkdownV2(text string) string {
+	const specialChars = `_*[]()~` + "`" + `>#+-=|{}.!`
+
+	var b strings.Builder
+	b.Grow(len(text))
+
+	i := 0
+	for i < len(text) {
+		// Check for fenced code block ```
+		if i+2 < len(text) && text[i:i+3] == "```" {
+			end := strings.Index(text[i+3:], "```")
+			if end >= 0 {
+				b.WriteString(text[i : i+3+end+3])
+				i += 3 + end + 3
+				continue
+			}
+		}
+		// Check for inline code `
+		if text[i] == '`' {
+			end := strings.IndexByte(text[i+1:], '`')
+			if end >= 0 {
+				b.WriteString(text[i : i+1+end+1])
+				i += 1 + end + 1
+				continue
+			}
+		}
+		// Escape special characters outside code
+		if strings.ContainsRune(specialChars, rune(text[i])) {
+			b.WriteByte('\\')
+		}
+		b.WriteByte(text[i])
+		i++
+	}
+	return b.String()
 }
 
 // bytesReader wraps []byte for telebot file upload.

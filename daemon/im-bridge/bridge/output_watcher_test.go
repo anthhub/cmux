@@ -130,3 +130,241 @@ func TestSplitMessage_HardSplitsLongSingleLine(t *testing.T) {
 		t.Fatal("split chunks did not preserve content")
 	}
 }
+
+// --- stripBoxChars tests ---
+
+func TestStripBoxChars_ClaudeCodeBox(t *testing.T) {
+	input := "╭─ Read file ─────╮\n│ src/login.tsx   │\n╰─────────────────╯"
+	result := stripBoxChars(input)
+	if strings.Contains(result, "╭") || strings.Contains(result, "│") || strings.Contains(result, "─") {
+		t.Errorf("box chars not stripped: %q", result)
+	}
+	if !strings.Contains(result, "Read file") {
+		t.Errorf("content lost: %q", result)
+	}
+	if !strings.Contains(result, "src/login.tsx") {
+		t.Errorf("content lost: %q", result)
+	}
+}
+
+func TestStripBoxChars_ThickVariants(t *testing.T) {
+	input := "┏━━━┓\n┃ hi ┃\n┗━━━┛"
+	result := stripBoxChars(input)
+	if strings.ContainsAny(result, "┏━┓┃┗┛") {
+		t.Errorf("thick box chars not stripped: %q", result)
+	}
+	if !strings.Contains(result, "hi") {
+		t.Errorf("content lost: %q", result)
+	}
+}
+
+func TestStripBoxChars_PreservesNonBox(t *testing.T) {
+	input := "hello world\n✅ done"
+	result := stripBoxChars(input)
+	if result != input {
+		t.Errorf("got %q, want %q", result, input)
+	}
+}
+
+// --- stripSpinner tests ---
+
+func TestStripSpinner_BrailleSpinner(t *testing.T) {
+	input := "⠋ Working...\n✅ Done\n⠙ Loading..."
+	result := stripSpinner(input)
+	if strings.Contains(result, "⠋") || strings.Contains(result, "⠙") {
+		t.Errorf("spinner not stripped: %q", result)
+	}
+	if !strings.Contains(result, "✅ Done") {
+		t.Errorf("content lost: %q", result)
+	}
+}
+
+func TestStripSpinner_RecordIndicator(t *testing.T) {
+	input := "⏺ Reading file...\nsome content"
+	result := stripSpinner(input)
+	if strings.Contains(result, "⏺") {
+		t.Errorf("record indicator not stripped: %q", result)
+	}
+	if !strings.Contains(result, "some content") {
+		t.Errorf("content lost: %q", result)
+	}
+}
+
+func TestStripSpinner_BakedLine(t *testing.T) {
+	input := "result here\nBaked for 3.2s\nmore text"
+	result := stripSpinner(input)
+	if strings.Contains(result, "Baked for") {
+		t.Errorf("baked line not stripped: %q", result)
+	}
+	if !strings.Contains(result, "result here") || !strings.Contains(result, "more text") {
+		t.Errorf("content lost: %q", result)
+	}
+}
+
+func TestStripSpinner_WorkingThinking(t *testing.T) {
+	input := "Working...\nThinking...\nactual output"
+	result := stripSpinner(input)
+	if strings.Contains(result, "Working...") || strings.Contains(result, "Thinking...") {
+		t.Errorf("status lines not stripped: %q", result)
+	}
+	if !strings.Contains(result, "actual output") {
+		t.Errorf("content lost: %q", result)
+	}
+}
+
+func TestStripSpinner_CookedCrunched(t *testing.T) {
+	input := "Cooked for 1.5s\nCrunched for 2s"
+	result := stripSpinner(input)
+	trimmed := strings.TrimSpace(result)
+	if trimmed != "" {
+		t.Errorf("expected empty, got %q", trimmed)
+	}
+}
+
+// --- stripPrompt tests ---
+
+func TestStripPrompt_PurePrompt(t *testing.T) {
+	input := "qiyuan@MacBook-Pro ~/cmux % "
+	result := stripPrompt(input)
+	trimmed := strings.TrimSpace(result)
+	if trimmed != "" {
+		t.Errorf("expected empty, got %q", trimmed)
+	}
+}
+
+func TestStripPrompt_PromptWithCommand(t *testing.T) {
+	input := "qiyuan@MacBook-Pro ~/cmux % echo hello"
+	result := stripPrompt(input)
+	trimmed := strings.TrimSpace(result)
+	if trimmed != "echo hello" {
+		t.Errorf("got %q, want %q", trimmed, "echo hello")
+	}
+}
+
+func TestStripPrompt_DollarPrompt(t *testing.T) {
+	input := "user@hostname /tmp $ "
+	result := stripPrompt(input)
+	trimmed := strings.TrimSpace(result)
+	if trimmed != "" {
+		t.Errorf("expected empty, got %q", trimmed)
+	}
+}
+
+func TestStripPrompt_CondaPrefix(t *testing.T) {
+	input := "(myenv) user@host ~ % "
+	result := stripPrompt(input)
+	trimmed := strings.TrimSpace(result)
+	if trimmed != "" {
+		t.Errorf("expected empty, got %q", trimmed)
+	}
+}
+
+func TestStripPrompt_PreservesNonPrompt(t *testing.T) {
+	input := "this is regular text\nsome output"
+	result := stripPrompt(input)
+	if result != input {
+		t.Errorf("got %q, want %q", result, input)
+	}
+}
+
+// --- compressBlankLines tests ---
+
+func TestCompressBlankLines_LeadingTrailing(t *testing.T) {
+	input := "\n\nhello\n\n"
+	result := compressBlankLines(input)
+	if result != "hello" {
+		t.Errorf("got %q, want %q", result, "hello")
+	}
+}
+
+func TestCompressBlankLines_ThreePlusToOne(t *testing.T) {
+	input := "a\n\n\n\n\nb"
+	result := compressBlankLines(input)
+	expected := "a\n\nb"
+	if result != expected {
+		t.Errorf("got %q, want %q", result, expected)
+	}
+}
+
+func TestCompressBlankLines_TwoBlankPreserved(t *testing.T) {
+	input := "a\n\nb"
+	result := compressBlankLines(input)
+	if result != input {
+		t.Errorf("got %q, want %q", result, input)
+	}
+}
+
+// --- stripANSI enhanced tests ---
+
+func TestStripANSI_8bitCSI(t *testing.T) {
+	// 0xC2 0x9B is UTF-8 encoding of U+009B
+	input := string([]byte{0xC2, 0x9B}) + "31mred"
+	result := stripANSI(input)
+	if result != "red" {
+		t.Errorf("got %q, want %q", result, "red")
+	}
+}
+
+func TestStripANSI_PrivateSequence(t *testing.T) {
+	input := "\x1b[?25htext"
+	result := stripANSI(input)
+	if result != "text" {
+		t.Errorf("got %q, want %q", result, "text")
+	}
+}
+
+func TestStripANSI_ControlChars(t *testing.T) {
+	input := "hello\x01\x02world"
+	result := stripANSI(input)
+	if result != "helloworld" {
+		t.Errorf("got %q, want %q", result, "helloworld")
+	}
+}
+
+// --- cleanTerminalOutput integration test ---
+
+func TestCleanTerminalOutput_ClaudeCodeTUI(t *testing.T) {
+	input := "╭──────────────────────────╮\n" +
+		"│ ✅ Fixed src/login.tsx   │\n" +
+		"│                          │\n" +
+		"│ Added null check at L42  │\n" +
+		"╰──────────────────────────╯\n" +
+		"qiyuan@MacBook-Pro ~/cmux % "
+
+	result := cleanTerminalOutput(input)
+
+	if strings.ContainsAny(result, "╭╮╰╯│─") {
+		t.Errorf("box chars still present: %q", result)
+	}
+	if strings.Contains(result, "qiyuan@MacBook-Pro") {
+		t.Errorf("prompt still present: %q", result)
+	}
+	if !strings.Contains(result, "Fixed src/login.tsx") {
+		t.Errorf("content lost: %q", result)
+	}
+	if !strings.Contains(result, "Added null check at L42") {
+		t.Errorf("content lost: %q", result)
+	}
+}
+
+func TestCleanTerminalOutput_SpinnerAndContent(t *testing.T) {
+	input := "⠋ Working...\n\x1b[32m✅ Changes applied\x1b[0m\nBaked for 2.1s"
+	result := cleanTerminalOutput(input)
+	if strings.Contains(result, "Working...") {
+		t.Errorf("spinner not removed: %q", result)
+	}
+	if strings.Contains(result, "Baked for") {
+		t.Errorf("baked line not removed: %q", result)
+	}
+	if !strings.Contains(result, "Changes applied") {
+		t.Errorf("content lost: %q", result)
+	}
+}
+
+func TestCleanTerminalOutput_Empty(t *testing.T) {
+	result := cleanTerminalOutput("")
+	if result != "" {
+		t.Errorf("expected empty, got %q", result)
+	}
+}
+

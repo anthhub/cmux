@@ -2,6 +2,7 @@ package channels
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -125,6 +126,41 @@ func TestManager_StartStop(t *testing.T) {
 		t.Error("expected channel to be stopped after Stop")
 	}
 }
+
+func TestManager_Start_RollbackOnFailure(t *testing.T) {
+	mgr := NewManager()
+
+	successCh := NewMockChannel("aaa-success") // map iteration order is random; name prefix helps
+	failCh := &failingMockChannel{name: "zzz-fail", startErr: errors.New("start failed")}
+
+	mgr.Register(successCh)
+	mgr.Register(failCh)
+
+	err := mgr.Start(context.Background())
+	if err == nil {
+		t.Fatal("expected error from failing channel")
+	}
+
+	// If the successful channel was started before the failing one, it should be rolled back.
+	// Due to map iteration order, we check: if it was started, it must have been stopped.
+	if successCh.IsRunning() {
+		t.Error("expected success channel to be stopped after rollback")
+	}
+}
+
+// failingMockChannel is a Channel whose Start always returns an error.
+type failingMockChannel struct {
+	name     string
+	startErr error
+	stopped  bool
+	handler  func(InboundMessage)
+}
+
+func (c *failingMockChannel) Name() string                           { return c.name }
+func (c *failingMockChannel) Start(_ context.Context) error          { return c.startErr }
+func (c *failingMockChannel) Stop() error                            { c.stopped = true; return nil }
+func (c *failingMockChannel) Send(_ string, _ OutboundMessage) error { return nil }
+func (c *failingMockChannel) OnMessage(h func(InboundMessage))       { c.handler = h }
 
 // nonTypingChannel is a minimal Channel that does NOT implement TypingCapable.
 type nonTypingChannel struct {

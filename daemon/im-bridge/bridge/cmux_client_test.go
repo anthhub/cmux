@@ -283,6 +283,151 @@ func TestListWorkspaces_Success(t *testing.T) {
 	}
 }
 
+func TestListWorkspacesForWindow_UsesWindowID(t *testing.T) {
+	var capturedParams json.RawMessage
+	var mu sync.Mutex
+
+	sockPath := startMockCmuxSocket(t, func(method string, params json.RawMessage) (json.RawMessage, error) {
+		if method != "workspace.list" {
+			return nil, fmt.Errorf("unexpected method: %s", method)
+		}
+		mu.Lock()
+		capturedParams = params
+		mu.Unlock()
+		return json.RawMessage(`{"window_id":"win-1","workspaces":[{"id":"ws-1","title":"First","index":0}]}`), nil
+	})
+
+	client := NewCmuxClient(sockPath)
+	defer client.Close()
+
+	workspaces, err := client.ListWorkspacesForWindow("win-1")
+	if err != nil {
+		t.Fatalf("ListWorkspacesForWindow failed: %v", err)
+	}
+	if len(workspaces) != 1 {
+		t.Fatalf("len = %d, want 1", len(workspaces))
+	}
+	if workspaces[0].ID != "ws-1" {
+		t.Fatalf("workspaces[0].ID = %q, want %q", workspaces[0].ID, "ws-1")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	var p map[string]string
+	if err := json.Unmarshal(capturedParams, &p); err != nil {
+		t.Fatalf("unmarshal params: %v", err)
+	}
+	if p["window_id"] != "win-1" {
+		t.Fatalf("window_id = %q, want %q", p["window_id"], "win-1")
+	}
+}
+
+func TestListAllWorkspaces_AggregatesAcrossWindows(t *testing.T) {
+	var mu sync.Mutex
+	callCount := 0
+
+	sockPath := startMockCmuxSocket(t, func(method string, params json.RawMessage) (json.RawMessage, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		callCount++
+
+		switch method {
+		case "window.list":
+			return json.RawMessage(`{"windows":[{"id":"win-1","ref":"ref-win-1","index":0,"key":true,"visible":true,"workspace_count":1,"selected_workspace_id":"ws-1","selected_workspace_ref":"ref-ws-1"},{"id":"win-2","ref":"ref-win-2","index":1,"key":false,"visible":true,"workspace_count":1,"selected_workspace_id":"ws-2","selected_workspace_ref":"ref-ws-2"}]}`), nil
+		case "workspace.list":
+			var p map[string]string
+			if err := json.Unmarshal(params, &p); err != nil {
+				return nil, err
+			}
+			switch p["window_id"] {
+			case "win-1":
+				return json.RawMessage(`{"window_id":"win-1","workspaces":[{"id":"ws-1","title":"First","index":0}]}`), nil
+			case "win-2":
+				return json.RawMessage(`{"window_id":"win-2","workspaces":[{"id":"ws-2","title":"Second","index":0}]}`), nil
+			default:
+				return nil, fmt.Errorf("unexpected window_id: %s", p["window_id"])
+			}
+		default:
+			return nil, fmt.Errorf("unexpected method: %s", method)
+		}
+	})
+
+	client := NewCmuxClient(sockPath)
+	defer client.Close()
+
+	listings, err := client.ListAllWorkspaces()
+	if err != nil {
+		t.Fatalf("ListAllWorkspaces failed: %v", err)
+	}
+	if len(listings) != 2 {
+		t.Fatalf("len = %d, want 2", len(listings))
+	}
+	if listings[0].WindowID != "win-1" || listings[0].Workspace.ID != "ws-1" {
+		t.Fatalf("listings[0] = %+v, want win-1/ws-1", listings[0])
+	}
+	if listings[1].WindowID != "win-2" || listings[1].Workspace.Title != "Second" {
+		t.Fatalf("listings[1] = %+v, want win-2/Second", listings[1])
+	}
+	if callCount != 3 {
+		t.Fatalf("callCount = %d, want 3", callCount)
+	}
+}
+
+func TestRenameSurface_RetriesWithoutWorkspaceIDOnTabNotFound(t *testing.T) {
+	var mu sync.Mutex
+	callCount := 0
+	var paramsByCall []json.RawMessage
+
+	sockPath := startMockCmuxSocket(t, func(method string, params json.RawMessage) (json.RawMessage, error) {
+		if method != "tab.action" {
+			return nil, fmt.Errorf("unexpected method: %s", method)
+		}
+
+		mu.Lock()
+		callCount++
+		paramsByCall = append(paramsByCall, append(json.RawMessage(nil), params...))
+		currentCall := callCount
+		mu.Unlock()
+
+		if currentCall == 1 {
+			return nil, fmt.Errorf("Tab not found")
+		}
+		return json.RawMessage(`{}`), nil
+	})
+
+	client := NewCmuxClient(sockPath)
+	defer client.Close()
+
+	if err := client.RenameSurface("ws-1", "surf-1", "Renamed"); err != nil {
+		t.Fatalf("RenameSurface failed: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if callCount != 2 {
+		t.Fatalf("callCount = %d, want 2", callCount)
+	}
+
+	var first, second map[string]string
+	if err := json.Unmarshal(paramsByCall[0], &first); err != nil {
+		t.Fatalf("unmarshal first params: %v", err)
+	}
+	if err := json.Unmarshal(paramsByCall[1], &second); err != nil {
+		t.Fatalf("unmarshal second params: %v", err)
+	}
+	if first["workspace_id"] != "ws-1" {
+		t.Fatalf("first workspace_id = %q, want %q", first["workspace_id"], "ws-1")
+	}
+	if _, ok := second["workspace_id"]; ok {
+		t.Fatalf("second call unexpectedly included workspace_id: %v", second)
+	}
+	if second["surface_id"] != "surf-1" || second["title"] != "Renamed" {
+		t.Fatalf("second params = %v, want surface_id/title preserved", second)
+	}
+}
+
 func TestReconnect_WithBackoff(t *testing.T) {
 	// Use a non-existent socket path
 	client := NewCmuxClient("/tmp/nonexistent-test-socket.sock")

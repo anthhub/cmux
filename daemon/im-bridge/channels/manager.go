@@ -49,11 +49,21 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	var started []string
+
 	for name, ch := range m.channels {
 		log.Printf("[channels] starting %s", name)
 		if err := ch.Start(ctx); err != nil {
+			// Rollback: stop all previously started channels
+			for _, startedName := range started {
+				if sch, ok := m.channels[startedName]; ok {
+					log.Printf("[channels] rolling back %s", startedName)
+					sch.Stop()
+				}
+			}
 			return fmt.Errorf("failed to start channel %s: %w", name, err)
 		}
+		started = append(started, name)
 		log.Printf("[channels] %s started", name)
 	}
 	return nil
