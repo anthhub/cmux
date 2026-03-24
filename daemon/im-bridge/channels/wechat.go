@@ -109,23 +109,29 @@ func (w *WeChatChannel) Send(chatID string, msg OutboundMessage) error {
 	w.mu.Unlock()
 
 	req := wechatSendMsgReq{
-		BaseInfo: wechatBaseInfo{ChannelVersion: ""},
+		BaseInfo: wechatBaseInfo{ChannelVersion: "1.0.0"},
 		Message: wechatSendMsg{
-			ToWeixinID:   chatID,
-			FromWeixinID: botID,
-			MsgType:      2,
-			MsgState:     2,
-			Items:        []wechatMsgItem{{Text: &wechatTextItem{Content: msg.Text}}},
-			ClientID:     clientID,
+			ToUserID:   chatID,
+			FromUserID: botID,
+			MsgType:    2,
+			MsgState:   2,
+			Items:      []wechatMsgItem{{Type: 1, TextItem: &wechatTextItem{Text: msg.Text}}},
+			ClientID:   clientID,
 		},
 	}
 
+	// Debug: log the request
+	reqJSON, _ := json.Marshal(req)
+	log.Printf("[wechat-debug] sendMessage req: %s", string(reqJSON))
+
 	var resp wechatSendMsgResp
 	if err := w.doRequest(context.Background(), http.MethodPost, "/ilink/bot/sendmessage", req, &resp); err != nil {
+		log.Printf("[wechat] send error: %v", err)
 		return fmt.Errorf("wechat: send: %w", err)
 	}
-	if resp.Errcode != 0 {
-		return fmt.Errorf("wechat: send error %d: %s", resp.Errcode, resp.Errmsg)
+	log.Printf("[wechat-debug] sendMessage resp: ret=%d errcode=%d errmsg=%s", resp.Ret, resp.Errcode, resp.Errmsg)
+	if resp.Ret != 0 {
+		return fmt.Errorf("wechat: send error ret=%d errcode=%d: %s", resp.Ret, resp.Errcode, resp.Errmsg)
 	}
 	return nil
 }
@@ -149,12 +155,12 @@ func (w *WeChatChannel) pollLoop(ctx context.Context) {
 		}
 
 		req := wechatGetUpdatesReq{
-			BaseInfo:      wechatBaseInfo{ChannelVersion: ""},
+			BaseInfo:      wechatBaseInfo{ChannelVersion: "1.0.0"},
 			GetUpdatesBuf: w.syncBuf,
 		}
 
 		var resp wechatGetUpdatesResp
-		err := w.doRequest(ctx, http.MethodPost, "/ilink/bot/getupdates", req, &resp)
+		err := w.doRequestDebug(ctx, http.MethodPost, "/ilink/bot/getupdates", req, &resp)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -193,24 +199,27 @@ func (w *WeChatChannel) pollLoop(ctx context.Context) {
 		if resp.GetUpdatesBuf != "" {
 			w.syncBuf = resp.GetUpdatesBuf
 		}
+		if len(resp.Messages) > 0 {
+			log.Printf("[wechat] received %d messages", len(resp.Messages))
+		}
 
 		w.mu.Lock()
 		handler := w.handler
 		w.mu.Unlock()
 
 		for _, msg := range resp.Messages {
-			// Only process user messages (MsgType=1) that are new or finished (MsgState=0 or 2).
-			if msg.MsgType != 1 {
+			// Only process user messages (message_type=1) that are finished (message_state=0 or 2).
+			if msg.MsgType.String() != "1" {
 				continue
 			}
-			if msg.MsgState != 0 && msg.MsgState != 2 {
+			if msg.MsgState.String() != "0" && msg.MsgState.String() != "2" {
 				continue
 			}
 
 			// Infer bot ID from the first message received.
-			if w.botID == "" && msg.ToWeixinID != "" {
+			if w.botID == "" && msg.ToUserID != "" {
 				w.mu.Lock()
-				w.botID = msg.ToWeixinID
+				w.botID = msg.ToUserID
 				w.mu.Unlock()
 			}
 
@@ -222,8 +231,8 @@ func (w *WeChatChannel) pollLoop(ctx context.Context) {
 			if handler != nil {
 				handler(InboundMessage{
 					ChannelName: "wechat",
-					ChatID:      msg.FromWeixinID,
-					UserID:      msg.FromWeixinID,
+					ChatID:      msg.FromUserID,
+					UserID:      msg.FromUserID,
 					Text:        text,
 				})
 			}
@@ -272,56 +281,118 @@ func (w *WeChatChannel) doRequest(ctx context.Context, method, path string, body
 	return nil
 }
 
-// qrLogin performs QR code login to obtain a bot token.
+// doRequestDebug is like doRequest but logs the raw response (for debugging).
+func (w *WeChatChannel) doRequestDebug(ctx context.Context, method, path string, body, result interface{}) error {
+	var bodyReader io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			return fmt.Errorf("marshal request: %w", err)
+		}
+		bodyReader = bytes.NewReader(data)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, w.baseURL+path, bodyReader)
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+
+	w.setAuthHeaders(req)
+
+	resp, err := w.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("http request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read response: %w", err)
+	}
+
+	// Debug: log raw response (truncated)
+	raw := string(respBody)
+	if len(raw) > 2000 {
+		raw = raw[:2000] + "..."
+	}
+	if len(raw) > 20 { // skip empty polls
+		log.Printf("[wechat-debug] getUpdates raw: %s", raw)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("http %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	if result != nil {
+		if err := json.Unmarshal(respBody, result); err != nil {
+			return fmt.Errorf("unmarshal response: %w", err)
+		}
+	}
+	return nil
+}
+
+// qrLogin performs QR code login to obtain a bot token. Auto-retries on expiry.
 func (w *WeChatChannel) qrLogin(ctx context.Context) error {
 	log.Println("[wechat] no bot token, starting QR code login...")
 
-	var qrResp wechatQRCodeResp
-	if err := w.doRequest(ctx, http.MethodGet, "/ilink/bot/get_bot_qrcode?bot_type=3", nil, &qrResp); err != nil {
-		return fmt.Errorf("get qr code: %w", err)
-	}
-
-	log.Printf("[wechat] QR code obtained (ID: %s). Scan to login.", qrResp.QRCodeID)
-	if qrResp.ImageContent != "" {
-		log.Printf("[wechat] QR image data length: %d bytes (base64)", len(qrResp.ImageContent))
-	}
-
-	// Poll for QR code status.
-	pollURL := fmt.Sprintf("/ilink/bot/get_qrcode_status?qrcode=%s", qrResp.QRCodeID)
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
+	const maxRetries = 10
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 
-		var statusResp wechatQRStatusResp
-		if err := w.doRequest(ctx, http.MethodGet, pollURL, nil, &statusResp); err != nil {
-			log.Printf("[wechat] qr status poll error: %v", err)
-			time.Sleep(2 * time.Second)
-			continue
+		var qrResp wechatQRCodeResp
+		if err := w.doRequest(ctx, http.MethodGet, "/ilink/bot/get_bot_qrcode?bot_type=3", nil, &qrResp); err != nil {
+			return fmt.Errorf("get qr code: %w", err)
 		}
 
-		switch statusResp.Status {
-		case "confirmed":
-			w.botToken = statusResp.BotToken
-			w.botID = statusResp.ILinkBotID
-			if statusResp.BaseURL != "" {
-				w.baseURL = statusResp.BaseURL
+		log.Printf("[wechat] ========================================")
+		log.Printf("[wechat] Scan this QR code to login WeChat:")
+		log.Printf("[wechat] %s", qrResp.ImageContent)
+		log.Printf("[wechat] ========================================")
+
+		// Poll for QR code status.
+		pollURL := fmt.Sprintf("/ilink/bot/get_qrcode_status?qrcode=%s", qrResp.QRCodeID)
+		expired := false
+		for !expired {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
 			}
-			log.Printf("[wechat] QR login successful, bot ID: %s", w.botID)
-			w.saveCredentials()
-			return nil
-		case "expired":
-			return fmt.Errorf("QR code expired")
-		case "scanned":
-			log.Println("[wechat] QR code scanned, waiting for confirmation...")
-		default:
-			// "wait" or other — keep polling.
-		}
 
-		time.Sleep(2 * time.Second)
+			var statusResp wechatQRStatusResp
+			if err := w.doRequest(ctx, http.MethodGet, pollURL, nil, &statusResp); err != nil {
+				log.Printf("[wechat] qr status poll error: %v", err)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+
+			switch statusResp.Status {
+			case "confirmed":
+				w.botToken = statusResp.BotToken
+				w.botID = statusResp.ILinkBotID
+				if statusResp.BaseURL != "" {
+					w.baseURL = statusResp.BaseURL
+				}
+				log.Printf("[wechat] QR login successful, bot ID: %s", w.botID)
+				w.saveCredentials()
+				return nil
+			case "expired":
+				log.Println("[wechat] QR code expired, generating new one...")
+				expired = true
+			case "scanned":
+				log.Println("[wechat] QR code scanned, waiting for confirmation...")
+			default:
+				// "wait" or other — keep polling.
+			}
+
+			if !expired {
+				time.Sleep(2 * time.Second)
+			}
+		}
 	}
+	return fmt.Errorf("QR login failed after %d attempts", maxRetries)
 }
 
 func (w *WeChatChannel) setAuthHeaders(req *http.Request) {
@@ -385,8 +456,8 @@ func (w *WeChatChannel) loadCredentials() {
 func extractText(items []wechatMsgItem) string {
 	var text string
 	for _, item := range items {
-		if item.Text != nil {
-			text += item.Text.Content
+		if item.TextItem != nil && item.TextItem.Text != "" {
+			text += item.TextItem.Text
 		}
 	}
 	return text
@@ -407,36 +478,42 @@ func newUUID() (string, error) {
 // --- Wire types ---
 
 type wechatBaseInfo struct {
-	ChannelVersion string `json:"channelVersion"`
+	ChannelVersion string `json:"channel_version"`
 }
 
 type wechatGetUpdatesReq struct {
-	BaseInfo      wechatBaseInfo `json:"baseInfo"`
-	GetUpdatesBuf string         `json:"getUpdatesBuf"`
+	BaseInfo      wechatBaseInfo `json:"base_info"`
+	GetUpdatesBuf string         `json:"get_updates_buf"`
 }
 
 type wechatGetUpdatesResp struct {
 	Errcode       int              `json:"errcode"`
 	Errmsg        string           `json:"errmsg"`
-	Messages      []wechatMessage  `json:"messages"`
-	GetUpdatesBuf string           `json:"getUpdatesBuf"`
+	Messages      []wechatMessage  `json:"msgs"`
+	GetUpdatesBuf string           `json:"get_updates_buf"`
 }
 
 type wechatMessage struct {
-	FromWeixinID string          `json:"fromWeixinID"`
-	ToWeixinID   string          `json:"toWeixinID"`
-	MsgType      int             `json:"msgType"`
-	MsgState     int             `json:"msgState"`
-	Items        []wechatMsgItem `json:"items"`
+	Seq            int             `json:"seq"`
+	MessageID      int64           `json:"message_id"`
+	FromUserID     string          `json:"from_user_id"`
+	ToUserID       string          `json:"to_user_id"`
+	ClientID       string          `json:"client_id"`
+	MsgType        json.Number     `json:"message_type"`
+	MsgState       json.Number     `json:"message_state"`
+	Items          []wechatMsgItem `json:"item_list"`
+	ContextToken   string          `json:"context_token"`
+	CreateTimeMs   int64           `json:"create_time_ms"`
 }
 
 type wechatMsgItem struct {
-	Text  *wechatTextItem  `json:"text,omitempty"`
-	Image *wechatImageItem `json:"image,omitempty"`
+	Type     int              `json:"type"` // 1=text, 2=image
+	TextItem *wechatTextItem  `json:"text_item,omitempty"`
+	Image    *wechatImageItem `json:"image_item,omitempty"`
 }
 
 type wechatTextItem struct {
-	Content string `json:"content"`
+	Text string `json:"text"`
 }
 
 type wechatImageItem struct {
@@ -444,33 +521,37 @@ type wechatImageItem struct {
 }
 
 type wechatSendMsgReq struct {
-	BaseInfo wechatBaseInfo `json:"baseInfo"`
+	BaseInfo wechatBaseInfo `json:"base_info"`
 	Message  wechatSendMsg  `json:"message"`
 }
 
 type wechatSendMsg struct {
-	ToWeixinID   string          `json:"toWeixinID"`
-	FromWeixinID string          `json:"fromWeixinID"`
-	MsgType      int             `json:"msgType"`
-	MsgState     int             `json:"msgState"`
-	Items        []wechatMsgItem `json:"items"`
-	ClientID     string          `json:"clientID"`
+	ToUserID     string          `json:"to_user_id"`
+	FromUserID   string          `json:"from_user_id"`
+	MsgType      int             `json:"message_type"`
+	MsgState     int             `json:"message_state"`
+	Items        []wechatMsgItem `json:"item_list"`
+	ClientID     string          `json:"client_id"`
+	ContextToken string          `json:"context_token,omitempty"`
 }
 
 type wechatSendMsgResp struct {
+	Ret     int    `json:"ret"`
 	Errcode int    `json:"errcode"`
 	Errmsg  string `json:"errmsg"`
 }
 
 type wechatQRCodeResp struct {
-	QRCodeID     string `json:"qrcodeID"`
-	ImageContent string `json:"imageContent"`
+	QRCodeID     string `json:"qrcode"`
+	ImageContent string `json:"qrcode_img_content"`
+	Ret          int    `json:"ret"`
 }
 
 type wechatQRStatusResp struct {
-	Status      string `json:"status"`
-	BotToken    string `json:"botToken"`
-	ILinkBotID  string `json:"ilinkBotID"`
-	BaseURL     string `json:"baseURL"`
-	ILinkUserID string `json:"ilinkUserID"`
+	Ret         int    `json:"ret"`
+	Status      string `json:"status"`      // "wait", "scanned", "confirmed", "expired"
+	BotToken    string `json:"bot_token"`    // available when confirmed
+	ILinkBotID  string `json:"ilink_bot_id"` // available when confirmed
+	BaseURL     string `json:"base_url"`     // available when confirmed
+	ILinkUserID string `json:"ilink_user_id"` // available when confirmed
 }

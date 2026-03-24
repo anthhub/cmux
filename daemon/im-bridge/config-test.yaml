@@ -1,0 +1,30 @@
+cmux:
+  socket_path: "/Users/qiyuan/Library/Application Support/cmux/cmux.sock"
+
+ai:
+  default_agent: "shell" # shell mode first (no API key needed)
+  workdir: ""
+  claude_path: "claude"
+  claude_model: ""
+  claude_permission_mode: "default"
+  codex_path: "codex"
+  codex_model: ""
+
+telegram:
+  enabled: true
+  bot_token: "8748900318:AAE84k4ld0rmzHELfA8xlaQteVSpveleVS0"
+
+slack:
+  enabled: false
+feishu:
+  enabled: false
+discord:
+  enabled: false
+
+wechat:
+  enabled: true
+  bot_token: "" # empty = QR code login on startup
+  credentials_dir: "" # default: ~/.weclaw/accounts
+
+security:
+  allowed_users: [] # allow all for testing
