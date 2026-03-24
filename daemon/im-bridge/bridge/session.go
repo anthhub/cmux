@@ -724,7 +724,7 @@ func (sm *SessionManager) handleAIInput(agent *Agent, session *Session, msg chan
 
 	ctx, cancel := context.WithCancel(sm.ctx)
 	session.setWatchCancel(cancel)
-	go sm.watchOutput(ctx, agent.workspaceID(), session, msg.ChannelName, msg.ChatID)
+	go sm.watchOutput(ctx, agent.workspaceID(), session, msg.ChannelName, msg.ChatID, msg.ContextToken)
 
 	if err := sm.cmux.SendText(agent.workspaceID(), session.SurfaceID, prompt+"\n"); err != nil {
 		session.stopWatching()
@@ -756,7 +756,7 @@ func (sm *SessionManager) handleBash(agent *Agent, msg channels.InboundMessage, 
 
 	ctx, cancel := context.WithCancel(sm.ctx)
 	session.setWatchCancel(cancel)
-	go sm.watchOutput(ctx, agent.workspaceID(), session, msg.ChannelName, msg.ChatID)
+	go sm.watchOutput(ctx, agent.workspaceID(), session, msg.ChannelName, msg.ChatID, msg.ContextToken)
 
 	if err := sm.cmux.SendText(agent.workspaceID(), session.SurfaceID, command+"\n"); err != nil {
 		session.stopWatching()
@@ -1345,18 +1345,23 @@ func (sm *SessionManager) send(channelName, chatID string, msg channels.Outbound
 }
 
 func (sm *SessionManager) reply(msg channels.InboundMessage, text string) {
-	sm.sendText(msg.ChannelName, msg.ChatID, text)
+	sm.sendTextWithContext(msg.ChannelName, msg.ChatID, msg.ContextToken, text)
 }
 
 func (sm *SessionManager) sendText(channelName, chatID, text string) {
+	sm.sendTextWithContext(channelName, chatID, "", text)
+}
+
+func (sm *SessionManager) sendTextWithContext(channelName, chatID, contextToken, text string) {
 	chunks := splitMessage(text, sm.channel.MaxMessageLength(channelName))
 	if len(chunks) == 0 {
 		chunks = []string{text}
 	}
 	for _, chunk := range chunks {
 		sm.send(channelName, chatID, channels.OutboundMessage{
-			Text:   chunk,
-			Format: "text",
+			Text:         chunk,
+			Format:       "text",
+			ContextToken: contextToken,
 		})
 	}
 }

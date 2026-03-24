@@ -122,6 +122,7 @@ func Load(path string) (*Config, error) {
 	}
 	if token := os.Getenv("WECHAT_BOT_TOKEN"); token != "" {
 		cfg.WeChat.BotToken = token
+		cfg.WeChat.Enabled = true
 	}
 
 	return &cfg, nil

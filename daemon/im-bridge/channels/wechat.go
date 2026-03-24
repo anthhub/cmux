@@ -19,8 +19,9 @@ import (
 )
 
 const (
-	wechatDefaultBaseURL = "https://ilinkai.weixin.qq.com"
-	wechatMaxMsgLen      = 4096
+	wechatDefaultBaseURL     = "https://ilinkai.weixin.qq.com"
+	wechatMaxMsgLen          = 4096
+	wechatDefaultCredsSubdir = ".weclaw/accounts"
 )
 
 func init() {
@@ -52,21 +53,23 @@ type WeChatChannel struct {
 func NewWeChatChannel(botToken, credsDir string) (*WeChatChannel, error) {
 	n, _ := rand.Int(rand.Reader, big.NewInt(1<<62))
 	uin := fmt.Sprintf("%d", n.Int64())
+	resolvedCredsDir := resolveWeChatCredentialsDir(credsDir)
 
 	w := &WeChatChannel{
 		BaseChannel: NewBaseChannel("wechat", wechatMaxMsgLen, nil),
-		botToken:    botToken,
 		baseURL:     wechatDefaultBaseURL,
 		uin:         uin,
-		credsDir:    credsDir,
+		credsDir:    resolvedCredsDir,
 		httpClient: &http.Client{
 			Timeout: 40 * time.Second,
 		},
 	}
 
-	// Try loading saved credentials if no token provided.
-	if w.botToken == "" && w.credsDir != "" {
+	if w.credsDir != "" {
 		w.loadCredentials()
+	}
+	if botToken != "" {
+		w.botToken = botToken
 	}
 
 	return w, nil
@@ -111,12 +114,13 @@ func (w *WeChatChannel) Send(chatID string, msg OutboundMessage) error {
 	req := wechatSendMsgReq{
 		BaseInfo: wechatBaseInfo{ChannelVersion: "1.0.0"},
 		Message: wechatSendMsg{
-			ToUserID:   chatID,
-			FromUserID: botID,
-			MsgType:    2,
-			MsgState:   2,
-			Items:      []wechatMsgItem{{Type: 1, TextItem: &wechatTextItem{Text: msg.Text}}},
-			ClientID:   clientID,
+			ToUserID:     chatID,
+			FromUserID:   botID,
+			MsgType:      2,
+			MsgState:     2,
+			Items:        []wechatMsgItem{{Type: 1, TextItem: &wechatTextItem{Text: msg.Text}}},
+			ClientID:     clientID,
+			ContextToken: msg.ContextToken,
 		},
 	}
 
@@ -179,6 +183,7 @@ func (w *WeChatChannel) pollLoop(ctx context.Context) {
 		if resp.Errcode == -14 {
 			log.Println("[wechat] session expired (errcode -14), resetting sync buffer")
 			w.syncBuf = ""
+			w.saveCredentials()
 			backoff = 3 * time.Second
 			continue
 		}
@@ -198,6 +203,7 @@ func (w *WeChatChannel) pollLoop(ctx context.Context) {
 		backoff = 3 * time.Second
 		if resp.GetUpdatesBuf != "" {
 			w.syncBuf = resp.GetUpdatesBuf
+			w.saveCredentials()
 		}
 		if len(resp.Messages) > 0 {
 			log.Printf("[wechat] received %d messages", len(resp.Messages))
@@ -230,10 +236,11 @@ func (w *WeChatChannel) pollLoop(ctx context.Context) {
 
 			if handler != nil {
 				handler(InboundMessage{
-					ChannelName: "wechat",
-					ChatID:      msg.FromUserID,
-					UserID:      msg.FromUserID,
-					Text:        text,
+					ChannelName:  "wechat",
+					ChatID:       msg.FromUserID,
+					UserID:       msg.FromUserID,
+					Text:         text,
+					ContextToken: msg.ContextToken,
 				})
 			}
 		}
@@ -413,10 +420,11 @@ func (w *WeChatChannel) saveCredentials() {
 		log.Printf("[wechat] failed to create creds dir: %v", err)
 		return
 	}
-	creds := map[string]string{
-		"bot_token": w.botToken,
-		"bot_id":    w.botID,
-		"base_url":  w.baseURL,
+	creds := wechatCredentials{
+		BotToken: w.botToken,
+		BotID:    w.botID,
+		BaseURL:  w.baseURL,
+		SyncBuf:  w.syncBuf,
 	}
 	data, _ := json.Marshal(creds)
 	path := filepath.Join(w.credsDir, "wechat_credentials.json")
@@ -434,22 +442,36 @@ func (w *WeChatChannel) loadCredentials() {
 	if err != nil {
 		return
 	}
-	var creds map[string]string
+	var creds wechatCredentials
 	if err := json.Unmarshal(data, &creds); err != nil {
 		return
 	}
-	if token, ok := creds["bot_token"]; ok && token != "" {
-		w.botToken = token
+	if creds.BotToken != "" {
+		w.botToken = creds.BotToken
 	}
-	if id, ok := creds["bot_id"]; ok && id != "" {
-		w.botID = id
+	if creds.BotID != "" {
+		w.botID = creds.BotID
 	}
-	if url, ok := creds["base_url"]; ok && url != "" {
-		w.baseURL = url
+	if creds.BaseURL != "" {
+		w.baseURL = creds.BaseURL
+	}
+	if creds.SyncBuf != "" {
+		w.syncBuf = creds.SyncBuf
 	}
 	if w.botToken != "" {
 		log.Printf("[wechat] loaded saved credentials from %s", path)
 	}
+}
+
+func resolveWeChatCredentialsDir(credsDir string) string {
+	if credsDir != "" {
+		return credsDir
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil || homeDir == "" {
+		return credsDir
+	}
+	return filepath.Join(homeDir, wechatDefaultCredsSubdir)
 }
 
 // extractText concatenates text content from message items.
@@ -487,23 +509,23 @@ type wechatGetUpdatesReq struct {
 }
 
 type wechatGetUpdatesResp struct {
-	Errcode       int              `json:"errcode"`
-	Errmsg        string           `json:"errmsg"`
-	Messages      []wechatMessage  `json:"msgs"`
-	GetUpdatesBuf string           `json:"get_updates_buf"`
+	Errcode       int             `json:"errcode"`
+	Errmsg        string          `json:"errmsg"`
+	Messages      []wechatMessage `json:"msgs"`
+	GetUpdatesBuf string          `json:"get_updates_buf"`
 }
 
 type wechatMessage struct {
-	Seq            int             `json:"seq"`
-	MessageID      int64           `json:"message_id"`
-	FromUserID     string          `json:"from_user_id"`
-	ToUserID       string          `json:"to_user_id"`
-	ClientID       string          `json:"client_id"`
-	MsgType        json.Number     `json:"message_type"`
-	MsgState       json.Number     `json:"message_state"`
-	Items          []wechatMsgItem `json:"item_list"`
-	ContextToken   string          `json:"context_token"`
-	CreateTimeMs   int64           `json:"create_time_ms"`
+	Seq          int             `json:"seq"`
+	MessageID    int64           `json:"message_id"`
+	FromUserID   string          `json:"from_user_id"`
+	ToUserID     string          `json:"to_user_id"`
+	ClientID     string          `json:"client_id"`
+	MsgType      json.Number     `json:"message_type"`
+	MsgState     json.Number     `json:"message_state"`
+	Items        []wechatMsgItem `json:"item_list"`
+	ContextToken string          `json:"context_token"`
+	CreateTimeMs int64           `json:"create_time_ms"`
 }
 
 type wechatMsgItem struct {
@@ -549,9 +571,16 @@ type wechatQRCodeResp struct {
 
 type wechatQRStatusResp struct {
 	Ret         int    `json:"ret"`
-	Status      string `json:"status"`      // "wait", "scanned", "confirmed", "expired"
-	BotToken    string `json:"bot_token"`    // available when confirmed
-	ILinkBotID  string `json:"ilink_bot_id"` // available when confirmed
-	BaseURL     string `json:"base_url"`     // available when confirmed
+	Status      string `json:"status"`        // "wait", "scanned", "confirmed", "expired"
+	BotToken    string `json:"bot_token"`     // available when confirmed
+	ILinkBotID  string `json:"ilink_bot_id"`  // available when confirmed
+	BaseURL     string `json:"base_url"`      // available when confirmed
 	ILinkUserID string `json:"ilink_user_id"` // available when confirmed
+}
+
+type wechatCredentials struct {
+	BotToken string `json:"bot_token"`
+	BotID    string `json:"bot_id"`
+	BaseURL  string `json:"base_url"`
+	SyncBuf  string `json:"sync_buf"`
 }

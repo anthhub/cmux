@@ -88,17 +88,17 @@ func (m *mockChannel) waitForSent(n int, timeout time.Duration) []mockSentMsg {
 	return m.getSent()
 }
 
-func setupPresenter(t *testing.T, verbose bool) (*IMPresenter, *mockChannel) {
+func setupPresenter(t *testing.T, verbose bool, contextToken string) (*IMPresenter, *mockChannel) {
 	t.Helper()
 	mock := newMockChannel("test")
 	mgr := channels.NewManager()
 	mgr.Register(mock)
-	presenter := NewIMPresenter(mgr, "test", "chat-1", verbose)
+	presenter := NewIMPresenter(mgr, "test", "chat-1", contextToken, verbose)
 	return presenter, mock
 }
 
 func TestIMPresenter_TextEvent_SendsMessage(t *testing.T) {
-	presenter, mock := setupPresenter(t, false)
+	presenter, mock := setupPresenter(t, false, "")
 
 	presenter.HandleEvent(StreamEvent{
 		Type:    StreamEventText,
@@ -123,7 +123,7 @@ func TestIMPresenter_TextEvent_SendsMessage(t *testing.T) {
 }
 
 func TestIMPresenter_Close_FlushesBuffer(t *testing.T) {
-	presenter, mock := setupPresenter(t, false)
+	presenter, mock := setupPresenter(t, false, "")
 
 	// Send a delta text event (will be buffered)
 	presenter.HandleEvent(StreamEvent{
@@ -152,7 +152,7 @@ func TestIMPresenter_Close_FlushesBuffer(t *testing.T) {
 }
 
 func TestIMPresenter_VerboseShowsToolUse(t *testing.T) {
-	presenter, mock := setupPresenter(t, true)
+	presenter, mock := setupPresenter(t, true, "")
 
 	presenter.HandleEvent(StreamEvent{
 		Type:    StreamEventToolUse,
@@ -177,7 +177,7 @@ func TestIMPresenter_VerboseShowsToolUse(t *testing.T) {
 }
 
 func TestIMPresenter_NormalHidesToolUse(t *testing.T) {
-	presenter, mock := setupPresenter(t, false)
+	presenter, mock := setupPresenter(t, false, "")
 
 	presenter.HandleEvent(StreamEvent{
 		Type:    StreamEventToolUse,
@@ -188,5 +188,23 @@ func TestIMPresenter_NormalHidesToolUse(t *testing.T) {
 	sent := mock.getSent()
 	if len(sent) != 0 {
 		t.Errorf("expected no messages in non-verbose mode for tool_use, got %d", len(sent))
+	}
+}
+
+func TestIMPresenter_PreservesContextToken(t *testing.T) {
+	presenter, mock := setupPresenter(t, false, "ctx-123")
+
+	presenter.HandleEvent(StreamEvent{
+		Type:    StreamEventText,
+		Content: "Hello from Claude",
+	})
+	presenter.Close()
+
+	sent := mock.getSent()
+	if len(sent) == 0 {
+		t.Fatal("expected at least one sent message")
+	}
+	if sent[0].msg.ContextToken != "ctx-123" {
+		t.Fatalf("ContextToken = %q, want %q", sent[0].msg.ContextToken, "ctx-123")
 	}
 }

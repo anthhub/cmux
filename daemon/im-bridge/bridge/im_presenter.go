@@ -22,10 +22,11 @@ type presentedPart struct {
 
 // IMPresenter renders normalized stream events to IM messages.
 type IMPresenter struct {
-	channel     *channels.Manager
-	channelName string
-	chatID      string
-	verbose     bool
+	channel      *channels.Manager
+	channelName  string
+	chatID       string
+	contextToken string
+	verbose      bool
 
 	// onControlRequest is called (without the presenter lock held) when a
 	// control_request event is received. The caller can use this to update
@@ -42,12 +43,13 @@ type IMPresenter struct {
 }
 
 // NewIMPresenter creates a new presenter for one chat turn.
-func NewIMPresenter(channel *channels.Manager, channelName, chatID string, verbose bool) *IMPresenter {
+func NewIMPresenter(channel *channels.Manager, channelName, chatID, contextToken string, verbose bool) *IMPresenter {
 	return &IMPresenter{
-		channel:     channel,
-		channelName: channelName,
-		chatID:      chatID,
-		verbose:     verbose,
+		channel:      channel,
+		channelName:  channelName,
+		chatID:       chatID,
+		contextToken: contextToken,
+		verbose:      verbose,
 	}
 }
 
@@ -134,7 +136,7 @@ func (p *IMPresenter) flushLocked(text string) {
 	}
 
 	for idx, partText := range parts {
-		msg := channels.OutboundMessage{Text: partText, Format: "text"}
+		msg := channels.OutboundMessage{Text: partText, Format: "text", ContextToken: p.contextToken}
 		if idx < len(p.parts) {
 			if p.parts[idx].Text == partText {
 				continue
@@ -183,8 +185,9 @@ func (p *IMPresenter) sendStandaloneLocked(text string) {
 		return
 	}
 	_ = p.channel.Send(p.channelName, p.chatID, channels.OutboundMessage{
-		Text:   text,
-		Format: "text",
+		Text:         text,
+		Format:       "text",
+		ContextToken: p.contextToken,
 	})
 }
 

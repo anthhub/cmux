@@ -22,7 +22,7 @@ const (
 // - Debounces rapid changes (waits for output to stabilize)
 // - Strips ANSI codes, cleans up terminal noise
 // - In AI mode, attempts to parse stream-json lines and route them through IMPresenter
-func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, session *Session, channelName, chatID string) {
+func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, session *Session, channelName, chatID, contextToken string) {
 	log.Printf("[watcher] starting for session %s (surface %s)", session.Name, session.SurfaceID)
 
 	isAI := session.agentType() != AgentTypeShell
@@ -30,7 +30,7 @@ func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, s
 	// For AI mode, create a per-turn presenter with a control_request callback.
 	var presenter *IMPresenter
 	if isAI {
-		presenter = NewIMPresenter(sm.channel, channelName, chatID, session.verbose())
+		presenter = NewIMPresenter(sm.channel, channelName, chatID, contextToken, session.verbose())
 		presenter.onControlRequest = func(event StreamEvent) {
 			sm.handleStreamEvent(session, event)
 		}
@@ -133,7 +133,7 @@ func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, s
 			log.Printf("[watcher] sending %d chars for session %s", len(pendingOutput), session.Name)
 			lastSentContent = pendingOutput
 
-			sm.sendText(channelName, chatID, pendingOutput)
+			sm.sendTextWithContext(channelName, chatID, contextToken, pendingOutput)
 			pendingOutput = ""
 		}
 	}

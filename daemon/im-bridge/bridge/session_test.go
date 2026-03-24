@@ -392,6 +392,26 @@ func TestReply_SplitsMessagesByChannelLimit(t *testing.T) {
 	}
 }
 
+func TestReply_PreservesContextToken(t *testing.T) {
+	sm, channel, _ := newTestSessionManager(t, func(method string, params json.RawMessage) (json.RawMessage, error) {
+		return nil, fmt.Errorf("unexpected cmux call: %s", method)
+	})
+
+	sm.reply(channels.InboundMessage{
+		ChannelName:  "test",
+		ChatID:       "chat-1",
+		ContextToken: "ctx-123",
+	}, "hello")
+
+	messages := channel.WaitForMessages(t, 1, 2*time.Second)
+	if len(messages) != 1 {
+		t.Fatalf("len(messages) = %d, want 1", len(messages))
+	}
+	if messages[0].ContextToken != "ctx-123" {
+		t.Fatalf("ContextToken = %q, want %q", messages[0].ContextToken, "ctx-123")
+	}
+}
+
 func TestHandleResetSession_SendsCtrlCAndRelaunches(t *testing.T) {
 	var sentTexts []string
 	sm, channel, _ := newTestSessionManager(t, func(method string, params json.RawMessage) (json.RawMessage, error) {

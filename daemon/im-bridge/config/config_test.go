@@ -78,6 +78,34 @@ telegram:
 	}
 }
 
+func TestLoad_WeChatEnvOverrideEnablesChannel(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+
+	content := `
+wechat:
+  enabled: false
+  bot_token: ""
+`
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	t.Setenv("WECHAT_BOT_TOKEN", "wechat-env-token")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	if cfg.WeChat.BotToken != "wechat-env-token" {
+		t.Errorf("BotToken = %q, want %q", cfg.WeChat.BotToken, "wechat-env-token")
+	}
+	if !cfg.WeChat.Enabled {
+		t.Error("WeChat.Enabled = false, want true (env override should enable)")
+	}
+}
+
 func TestLoad_FileNotFound(t *testing.T) {
 	_, err := Load("/nonexistent/path/config.yaml")
 	if err == nil {

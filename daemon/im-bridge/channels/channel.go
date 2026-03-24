@@ -44,18 +44,20 @@ type MessageLengthProvider interface {
 
 // InboundMessage represents a message received from an IM platform.
 type InboundMessage struct {
-	ChannelName string
-	ChatID      string
-	UserID      string
-	Text        string
-	Attachments []Attachment
+	ChannelName  string
+	ChatID       string
+	UserID       string
+	Text         string
+	ContextToken string
+	Attachments  []Attachment
 }
 
 // OutboundMessage represents a message to be sent to an IM platform.
 type OutboundMessage struct {
-	Text        string
-	Format      string // "text" | "markdown" | "code"
-	Attachments []Attachment
+	Text         string
+	Format       string // "text" | "markdown" | "code"
+	ContextToken string
+	Attachments  []Attachment
 }
 
 // Attachment represents a file or image attachment.
