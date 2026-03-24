@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 
 	"github.com/bwmarrin/discordgo"
 )
@@ -30,8 +31,9 @@ type discordFactoryCfg struct {
 // DiscordChannel implements Channel for Discord.
 type DiscordChannel struct {
 	*BaseChannel
-	session *discordgo.Session
-	handler func(InboundMessage)
+	session   *discordgo.Session
+	handlerMu sync.Mutex
+	handler   func(InboundMessage)
 }
 
 // NewDiscordChannel creates a Discord channel adapter.
@@ -51,8 +53,11 @@ func NewDiscordChannel(token string) (*DiscordChannel, error) {
 		if m.Author.ID == s.State.User.ID {
 			return
 		}
-		if ch.handler != nil {
-			ch.handler(InboundMessage{
+		ch.handlerMu.Lock()
+		h := ch.handler
+		ch.handlerMu.Unlock()
+		if h != nil {
+			h(InboundMessage{
 				ChatID: m.ChannelID,
 				UserID: m.Author.ID,
 				Text:   m.Content,
@@ -116,5 +121,7 @@ func (dc *DiscordChannel) EditStreaming(chatID, messageID string, msg OutboundMe
 }
 
 func (dc *DiscordChannel) OnMessage(handler func(InboundMessage)) {
+	dc.handlerMu.Lock()
+	defer dc.handlerMu.Unlock()
 	dc.handler = handler
 }

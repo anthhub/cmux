@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/socketmode"
@@ -32,9 +33,11 @@ type slackFactoryCfg struct {
 // SlackChannel implements Channel for Slack using Socket Mode.
 type SlackChannel struct {
 	*BaseChannel
-	api     *slack.Client
-	socket  *socketmode.Client
-	handler func(InboundMessage)
+	api       *slack.Client
+	socket    *socketmode.Client
+	handlerMu sync.Mutex
+	handler   func(InboundMessage)
+	cancel    context.CancelFunc
 }
 
 // NewSlackChannel creates a Slack channel adapter using Socket Mode.
@@ -52,6 +55,8 @@ func NewSlackChannel(botToken, appToken string) (*SlackChannel, error) {
 }
 
 func (sc *SlackChannel) Start(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	sc.cancel = cancel
 	sc.SetRunning(true)
 	go sc.run(ctx)
 	return nil
@@ -94,8 +99,11 @@ func (sc *SlackChannel) handleEvent(evt socketmode.Event) {
 			if inner.BotID != "" {
 				return
 			}
-			if sc.handler != nil {
-				sc.handler(InboundMessage{
+			sc.handlerMu.Lock()
+			h := sc.handler
+			sc.handlerMu.Unlock()
+			if h != nil {
+				h(InboundMessage{
 					ChatID: inner.Channel,
 					UserID: inner.User,
 					Text:   inner.Text,
@@ -109,6 +117,9 @@ func (sc *SlackChannel) handleEvent(evt socketmode.Event) {
 
 func (sc *SlackChannel) Stop() error {
 	sc.SetRunning(false)
+	if sc.cancel != nil {
+		sc.cancel()
+	}
 	return nil
 }
 
@@ -145,5 +156,7 @@ func (sc *SlackChannel) SendTyping(chatID string) (func(), error) {
 }
 
 func (sc *SlackChannel) OnMessage(handler func(InboundMessage)) {
+	sc.handlerMu.Lock()
+	defer sc.handlerMu.Unlock()
 	sc.handler = handler
 }

@@ -45,6 +45,7 @@ type WeChatChannel struct {
 	handler    func(InboundMessage)
 	syncBuf    string
 	credsDir   string
+	ctx        context.Context
 	cancel     context.CancelFunc
 	mu         sync.Mutex
 }
@@ -86,7 +87,10 @@ func (w *WeChatChannel) Start(ctx context.Context) error {
 	w.SetRunning(true)
 
 	ctx, cancel := context.WithCancel(ctx)
+	w.mu.Lock()
+	w.ctx = ctx
 	w.cancel = cancel
+	w.mu.Unlock()
 	go w.pollLoop(ctx)
 
 	return nil
@@ -124,16 +128,17 @@ func (w *WeChatChannel) Send(chatID string, msg OutboundMessage) error {
 		},
 	}
 
-	// Debug: log the request
-	reqJSON, _ := json.Marshal(req)
-	log.Printf("[wechat-debug] sendMessage req: %s", string(reqJSON))
-
 	var resp wechatSendMsgResp
-	if err := w.doRequest(context.Background(), http.MethodPost, "/ilink/bot/sendmessage", req, &resp); err != nil {
+	w.mu.Lock()
+	ctx := w.ctx
+	w.mu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := w.doRequest(ctx, http.MethodPost, "/ilink/bot/sendmessage", req, &resp); err != nil {
 		log.Printf("[wechat] send error: %v", err)
 		return fmt.Errorf("wechat: send: %w", err)
 	}
-	log.Printf("[wechat-debug] sendMessage resp: ret=%d errcode=%d errmsg=%s", resp.Ret, resp.Errcode, resp.Errmsg)
 	if resp.Ret != 0 {
 		return fmt.Errorf("wechat: send error ret=%d errcode=%d: %s", resp.Ret, resp.Errcode, resp.Errmsg)
 	}
@@ -158,13 +163,17 @@ func (w *WeChatChannel) pollLoop(ctx context.Context) {
 		default:
 		}
 
+		w.mu.Lock()
+		syncBuf := w.syncBuf
+		w.mu.Unlock()
+
 		req := wechatGetUpdatesReq{
 			BaseInfo:      wechatBaseInfo{ChannelVersion: "1.0.0"},
-			GetUpdatesBuf: w.syncBuf,
+			GetUpdatesBuf: syncBuf,
 		}
 
 		var resp wechatGetUpdatesResp
-		err := w.doRequestDebug(ctx, http.MethodPost, "/ilink/bot/getupdates", req, &resp)
+		err := w.doRequest(ctx, http.MethodPost, "/ilink/bot/getupdates", req, &resp)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -182,7 +191,9 @@ func (w *WeChatChannel) pollLoop(ctx context.Context) {
 		// Handle session expired error.
 		if resp.Errcode == -14 {
 			log.Println("[wechat] session expired (errcode -14), resetting sync buffer")
+			w.mu.Lock()
 			w.syncBuf = ""
+			w.mu.Unlock()
 			w.saveCredentials()
 			backoff = 3 * time.Second
 			continue
@@ -202,7 +213,9 @@ func (w *WeChatChannel) pollLoop(ctx context.Context) {
 		// Success — reset backoff and update sync buffer.
 		backoff = 3 * time.Second
 		if resp.GetUpdatesBuf != "" {
+			w.mu.Lock()
 			w.syncBuf = resp.GetUpdatesBuf
+			w.mu.Unlock()
 			w.saveCredentials()
 		}
 		if len(resp.Messages) > 0 {
@@ -223,9 +236,11 @@ func (w *WeChatChannel) pollLoop(ctx context.Context) {
 			}
 
 			// Infer bot ID from the first message received.
-			if w.botID == "" && msg.ToUserID != "" {
+			if msg.ToUserID != "" {
 				w.mu.Lock()
-				w.botID = msg.ToUserID
+				if w.botID == "" {
+					w.botID = msg.ToUserID
+				}
 				w.mu.Unlock()
 			}
 
@@ -288,59 +303,12 @@ func (w *WeChatChannel) doRequest(ctx context.Context, method, path string, body
 	return nil
 }
 
-// doRequestDebug is like doRequest but logs the raw response (for debugging).
-func (w *WeChatChannel) doRequestDebug(ctx context.Context, method, path string, body, result interface{}) error {
-	var bodyReader io.Reader
-	if body != nil {
-		data, err := json.Marshal(body)
-		if err != nil {
-			return fmt.Errorf("marshal request: %w", err)
-		}
-		bodyReader = bytes.NewReader(data)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, method, w.baseURL+path, bodyReader)
-	if err != nil {
-		return fmt.Errorf("create request: %w", err)
-	}
-
-	w.setAuthHeaders(req)
-
-	resp, err := w.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("http request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("read response: %w", err)
-	}
-
-	// Debug: log raw response (truncated)
-	raw := string(respBody)
-	if len(raw) > 2000 {
-		raw = raw[:2000] + "..."
-	}
-	if len(raw) > 20 { // skip empty polls
-		log.Printf("[wechat-debug] getUpdates raw: %s", raw)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("http %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	if result != nil {
-		if err := json.Unmarshal(respBody, result); err != nil {
-			return fmt.Errorf("unmarshal response: %w", err)
-		}
-	}
-	return nil
-}
-
 // qrLogin performs QR code login to obtain a bot token. Auto-retries on expiry.
 func (w *WeChatChannel) qrLogin(ctx context.Context) error {
 	log.Println("[wechat] no bot token, starting QR code login...")
+
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
 
 	const maxRetries = 10
 	for attempt := 0; attempt < maxRetries; attempt++ {
@@ -420,12 +388,14 @@ func (w *WeChatChannel) saveCredentials() {
 		log.Printf("[wechat] failed to create creds dir: %v", err)
 		return
 	}
+	w.mu.Lock()
 	creds := wechatCredentials{
 		BotToken: w.botToken,
 		BotID:    w.botID,
 		BaseURL:  w.baseURL,
 		SyncBuf:  w.syncBuf,
 	}
+	w.mu.Unlock()
 	data, _ := json.Marshal(creds)
 	path := filepath.Join(w.credsDir, "wechat_credentials.json")
 	if err := os.WriteFile(path, data, 0600); err != nil {

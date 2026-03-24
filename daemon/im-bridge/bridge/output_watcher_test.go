@@ -367,4 +367,3 @@ func TestCleanTerminalOutput_Empty(t *testing.T) {
 		t.Errorf("expected empty, got %q", result)
 	}
 }
-

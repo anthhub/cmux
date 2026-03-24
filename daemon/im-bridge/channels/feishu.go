@@ -9,12 +9,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sync"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
-	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
-	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
 	larkevent "github.com/larksuite/oapi-sdk-go/v3/event"
+	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
+	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 )
 
 func init() {
@@ -36,9 +37,10 @@ type feishuFactoryCfg struct {
 // FeishuChannel implements Channel for Feishu/Lark.
 type FeishuChannel struct {
 	*BaseChannel
-	client  *lark.Client
-	handler func(InboundMessage)
-	cancel  context.CancelFunc
+	client    *lark.Client
+	handlerMu sync.Mutex
+	handler   func(InboundMessage)
+	cancel    context.CancelFunc
 }
 
 // NewFeishuChannel creates a Feishu/Lark channel adapter.
@@ -59,7 +61,10 @@ func (fc *FeishuChannel) Start(ctx context.Context) error {
 	// Build event dispatcher for receiving messages.
 	eventDisp := dispatcher.NewEventDispatcher("", "").
 		OnP2MessageReceiveV1(func(ctx context.Context, event *larkim.P2MessageReceiveV1) error {
-			if fc.handler == nil {
+			fc.handlerMu.Lock()
+			h := fc.handler
+			fc.handlerMu.Unlock()
+			if h == nil {
 				return nil
 			}
 			msg := event.Event.Message
@@ -72,7 +77,7 @@ func (fc *FeishuChannel) Start(ctx context.Context) error {
 				senderID = larkcore.StringValue(event.Event.Sender.SenderId.OpenId)
 			}
 			chatID := larkcore.StringValue(msg.ChatId)
-			fc.handler(InboundMessage{
+			h(InboundMessage{
 				ChatID: chatID,
 				UserID: senderID,
 				Text:   text,
@@ -195,6 +200,8 @@ func (fc *FeishuChannel) EditStreaming(chatID, messageID string, msg OutboundMes
 }
 
 func (fc *FeishuChannel) OnMessage(handler func(InboundMessage)) {
+	fc.handlerMu.Lock()
+	defer fc.handlerMu.Unlock()
 	fc.handler = handler
 }
 

@@ -27,8 +27,9 @@ func init() {
 // TelegramChannel implements Channel for Telegram.
 type TelegramChannel struct {
 	*BaseChannel
-	bot     *tele.Bot
-	handler func(msg InboundMessage)
+	bot       *tele.Bot
+	handlerMu sync.Mutex
+	handler   func(msg InboundMessage)
 }
 
 // NewTelegramChannel creates a Telegram channel adapter.
@@ -50,11 +51,14 @@ func NewTelegramChannel(token string) (*TelegramChannel, error) {
 
 	// Handle all text messages
 	bot.Handle(tele.OnText, func(c tele.Context) error {
-		if tc.handler == nil {
+		tc.handlerMu.Lock()
+		h := tc.handler
+		tc.handlerMu.Unlock()
+		if h == nil {
 			return nil
 		}
 
-		tc.handler(InboundMessage{
+		h(InboundMessage{
 			ChatID: strconv.FormatInt(c.Chat().ID, 10),
 			UserID: strconv.FormatInt(c.Sender().ID, 10),
 			Text:   c.Text(),
@@ -205,6 +209,8 @@ func (tc *TelegramChannel) send(chatID string, msg OutboundMessage) (*tele.Messa
 }
 
 func (tc *TelegramChannel) OnMessage(handler func(msg InboundMessage)) {
+	tc.handlerMu.Lock()
+	defer tc.handlerMu.Unlock()
 	tc.handler = handler
 }
 

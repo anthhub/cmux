@@ -45,6 +45,14 @@ func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, s
 	var pendingOutput string
 	pendingTimer := time.NewTimer(0)
 	<-pendingTimer.C // drain initial fire
+	defer func() {
+		if !pendingTimer.Stop() {
+			select {
+			case <-pendingTimer.C:
+			default:
+			}
+		}
+	}()
 
 	for {
 		select {
