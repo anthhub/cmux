@@ -49,10 +49,7 @@ type Agent struct {
 	Sessions     map[string]*Session
 	SessionOrder []string
 	ActiveSID    string
-
-	workspaceOnce sync.Once
-	workspaceErr  error
-	mu            sync.RWMutex
+	mu           sync.RWMutex
 }
 
 // Session represents one IM conversation mapped to a cmux surface.
@@ -256,43 +253,33 @@ func (sm *SessionManager) ensureActiveAgent(user *UserState) (*Agent, error) {
 }
 
 func (sm *SessionManager) ensureAgentWorkspace(userID string, agent *Agent) (bool, error) {
-	if workspaceID := agent.workspaceID(); workspaceID != "" {
-		return false, nil
-	}
-
-	created := false
-	agent.workspaceOnce.Do(func() {
-		title := workspaceTitle(userID, agent.Name)
-		if workspaceID, err := sm.findWorkspaceIDByTitle(title); err == nil && workspaceID != "" {
-			agent.setWorkspaceID(workspaceID)
-			return
-		}
-
-		ws, err := sm.cmux.CreateWorkspace(title)
-		if err != nil {
-			agent.workspaceErr = fmt.Errorf("create workspace for agent %q: %w", agent.Name, err)
-			return
-		}
-		created = true
-		agent.setWorkspaceID(ws.ID)
-	})
-	if agent.workspaceErr != nil {
-		return false, agent.workspaceErr
-	}
-	return created, nil
-}
-
-func (sm *SessionManager) findWorkspaceIDByTitle(title string) (string, error) {
+	title := workspaceTitle(userID, agent.Name)
 	workspaces, err := sm.cmux.ListWorkspaces()
 	if err != nil {
-		return "", err
+		return false, fmt.Errorf("list workspaces for agent %q: %w", agent.Name, err)
 	}
-	for _, workspace := range workspaces {
-		if strings.TrimSpace(workspace.Title) == title {
-			return workspace.ID, nil
+
+	if workspaceID := agent.workspaceID(); workspaceID != "" {
+		for _, workspace := range workspaces {
+			if workspace.ID == workspaceID {
+				return false, nil
+			}
 		}
 	}
-	return "", nil
+
+	for _, workspace := range workspaces {
+		if strings.TrimSpace(workspace.Title) == strings.TrimSpace(title) {
+			agent.setWorkspaceID(workspace.ID)
+			return false, nil
+		}
+	}
+
+	ws, err := sm.cmux.CreateWorkspace(title)
+	if err != nil {
+		return false, fmt.Errorf("create workspace for agent %q: %w", agent.Name, err)
+	}
+	agent.setWorkspaceID(ws.ID)
+	return true, nil
 }
 
 func (sm *SessionManager) syncAgentSessions(agent *Agent) error {
@@ -313,6 +300,7 @@ func (sm *SessionManager) syncAgentSessions(agent *Agent) error {
 	if existing == nil {
 		existing = make(map[string]*Session)
 	}
+	defaultType := effectiveAgentType(agent.DefaultType, AgentTypeClaude)
 
 	sessions := make(map[string]*Session, len(surfaces))
 	order := make([]string, 0, len(surfaces))
@@ -324,14 +312,14 @@ func (sm *SessionManager) syncAgentSessions(agent *Agent) error {
 			session = &Session{
 				ID:        surface.ID,
 				SurfaceID: surface.ID,
-				AgentType: agent.defaultType(),
+				AgentType: defaultType,
 			}
 		}
 
 		session.Name = sessionNameForSurface(surface, index)
 		session.SurfaceType = surface.Type
 		if session.AgentType == "" {
-			session.AgentType = agent.defaultType()
+			session.AgentType = defaultType
 		}
 		sessions[session.ID] = session
 		order = append(order, session.ID)
@@ -1327,10 +1315,20 @@ func (sm *SessionManager) send(channelName, chatID string, msg channels.Outbound
 }
 
 func (sm *SessionManager) reply(msg channels.InboundMessage, text string) {
-	sm.send(msg.ChannelName, msg.ChatID, channels.OutboundMessage{
-		Text:   text,
-		Format: "text",
-	})
+	sm.sendText(msg.ChannelName, msg.ChatID, text)
+}
+
+func (sm *SessionManager) sendText(channelName, chatID, text string) {
+	chunks := splitMessage(text, sm.channel.MaxMessageLength(channelName))
+	if len(chunks) == 0 {
+		chunks = []string{text}
+	}
+	for _, chunk := range chunks {
+		sm.send(channelName, chatID, channels.OutboundMessage{
+			Text:   chunk,
+			Format: "text",
+		})
+	}
 }
 
 func (u *UserState) ensureAgent(name, defaultType string) *Agent {

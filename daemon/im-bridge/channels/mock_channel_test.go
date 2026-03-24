@@ -12,6 +12,7 @@ type MockChannel struct {
 	edited   []editedRecord
 	handler  func(InboundMessage)
 	running  bool
+	maxLen   int
 	mu       sync.Mutex
 }
 
@@ -22,7 +23,7 @@ type editedRecord struct {
 }
 
 func NewMockChannel(name string) *MockChannel {
-	return &MockChannel{name: name}
+	return &MockChannel{name: name, maxLen: 4000}
 }
 
 func (m *MockChannel) Name() string { return m.name }
@@ -68,7 +69,20 @@ func (m *MockChannel) EditStreaming(chatID, messageID string, msg OutboundMessag
 	return nil
 }
 
-func (m *MockChannel) MaxMessageLength() int { return 4000 }
+func (m *MockChannel) MaxMessageLength() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.maxLen > 0 {
+		return m.maxLen
+	}
+	return 4000
+}
+
+func (m *MockChannel) SetMaxMessageLength(maxLen int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.maxLen = maxLen
+}
 
 // SimulateInbound triggers the registered handler with a message.
 func (m *MockChannel) SimulateInbound(msg InboundMessage) {

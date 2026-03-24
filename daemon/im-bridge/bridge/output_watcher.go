@@ -6,8 +6,6 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
-
-	"github.com/manaflow-ai/cmux/daemon/im-bridge/channels"
 )
 
 const (
@@ -77,7 +75,11 @@ func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, s
 			}
 
 			// Accumulate into pending buffer and debounce (wait 1s for output to stabilize)
-			pendingOutput = cleaned
+			if pendingOutput == "" {
+				pendingOutput = cleaned
+			} else {
+				pendingOutput += "\n" + cleaned
+			}
 			resetTimer(pendingTimer, 1*time.Second)
 
 		case <-pendingTimer.C:
@@ -88,14 +90,7 @@ func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, s
 			log.Printf("[watcher] sending %d chars for session %s", len(pendingOutput), session.Name)
 			lastSentContent = pendingOutput
 
-			for _, chunk := range splitMessage(pendingOutput, sm.channel.MaxMessageLength(channelName)) {
-				if err := sm.channel.Send(channelName, chatID, channels.OutboundMessage{
-					Text:   chunk,
-					Format: "text",
-				}); err != nil {
-					log.Printf("[watcher] failed to send output: %v", err)
-				}
-			}
+			sm.sendText(channelName, chatID, pendingOutput)
 			pendingOutput = ""
 		}
 	}
@@ -229,28 +224,53 @@ func stripANSI(s string) string {
 
 // splitMessage splits a long message into chunks respecting line boundaries.
 func splitMessage(text string, maxLen int) []string {
-	if len(text) <= maxLen {
+	if maxLen <= 0 || len(text) <= maxLen {
 		return []string{text}
 	}
 
 	var chunks []string
 	lines := strings.Split(text, "\n")
 	var current strings.Builder
+	flush := func() {
+		if current.Len() == 0 {
+			return
+		}
+		chunks = append(chunks, current.String())
+		current.Reset()
+	}
 
 	for _, line := range lines {
-		if current.Len()+len(line)+1 > maxLen && current.Len() > 0 {
-			chunks = append(chunks, current.String())
-			current.Reset()
+		remaining := line
+		for {
+			prefixLen := 0
+			if current.Len() > 0 {
+				prefixLen = 1
+			}
+
+			available := maxLen - current.Len() - prefixLen
+			if available <= 0 {
+				flush()
+				continue
+			}
+
+			if len(remaining) <= available {
+				if current.Len() > 0 {
+					current.WriteByte('\n')
+				}
+				current.WriteString(remaining)
+				break
+			}
+
+			if current.Len() > 0 {
+				current.WriteByte('\n')
+			}
+			current.WriteString(remaining[:available])
+			remaining = remaining[available:]
+			flush()
 		}
-		if current.Len() > 0 {
-			current.WriteByte('\n')
-		}
-		current.WriteString(line)
 	}
 
-	if current.Len() > 0 {
-		chunks = append(chunks, current.String())
-	}
+	flush()
 
 	return chunks
 }

@@ -113,3 +113,20 @@ func TestSplitMessage_ExceedsLimit(t *testing.T) {
 		}
 	}
 }
+
+func TestSplitMessage_HardSplitsLongSingleLine(t *testing.T) {
+	text := strings.Repeat("x", 450)
+
+	result := splitMessage(text, 200)
+	if len(result) != 3 {
+		t.Fatalf("len = %d, want 3", len(result))
+	}
+	for i, chunk := range result {
+		if len(chunk) > 200 {
+			t.Fatalf("chunk[%d] len = %d, exceeds limit 200", i, len(chunk))
+		}
+	}
+	if strings.Join(result, "") != text {
+		t.Fatal("split chunks did not preserve content")
+	}
+}
