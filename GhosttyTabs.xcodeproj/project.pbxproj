@@ -1104,14 +1104,14 @@
 				minimumVersion = 2.5.1;
 			};
 		};
-			A5001252 /* XCRemoteSwiftPackageReference "sentry-cocoa" */ = {
-				isa = XCRemoteSwiftPackageReference;
-				repositoryURL = "https://github.com/getsentry/sentry-cocoa.git";
-				requirement = {
-					kind = upToNextMajorVersion;
-					minimumVersion = 9.3.0;
-				};
+		A5001252 /* XCRemoteSwiftPackageReference "sentry-cocoa" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/getsentry/sentry-cocoa.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 8.57.0;
 			};
+		};
 			A5001272 /* XCRemoteSwiftPackageReference "posthog-ios" */ = {
 				isa = XCRemoteSwiftPackageReference;
 				repositoryURL = "https://github.com/PostHog/posthog-ios.git";

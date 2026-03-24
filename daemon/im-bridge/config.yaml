@@ -1,6 +1,15 @@
 cmux:
   socket_path: "" # empty = auto-discover
 
+gateway:
+  state_path: "" # optional local bridge state file
+  media_dir: "" # optional local attachment cache
+
+default_agent: "claude"
+
+agents:
+  list: []
+
 ai:
   default_agent: "claude" # claude | codex | shell
   workdir: "" # empty = current repo
@@ -33,6 +42,9 @@ wechat:
   enabled: false
   bot_token: "" # set via WECHAT_BOT_TOKEN env var or QR code login
   credentials_dir: "" # default: ~/.weclaw/accounts
+  owner_ids: [] # optional single-owner allowlist
+  enable_groups: false
+  mention_patterns: [] # reserved for future group routing
 
 security:
   allowed_users: [] # empty = allow all; add user IDs to restrict

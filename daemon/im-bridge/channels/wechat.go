@@ -9,9 +9,12 @@ import (
 	"io"
 	"log"
 	"math/big"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,6 +26,8 @@ const (
 	wechatMaxMsgLen          = 4096
 	wechatDefaultCredsSubdir = ".weclaw/accounts"
 )
+
+var wechatMarkdownImageRe = regexp.MustCompile(`!\[[^\]]*\]\(([^)]+)\)`)
 
 func init() {
 	RegisterFactory("wechat", func(cfg interface{}) (Channel, error) {
@@ -115,6 +120,42 @@ func (w *WeChatChannel) Send(chatID string, msg OutboundMessage) error {
 	botID := w.botID
 	w.mu.Unlock()
 
+	text, imageURLs, fallbackText := normalizeWeChatOutbound(msg.Text, msg.Attachments)
+	items := make([]wechatMsgItem, 0, 1+len(imageURLs)+1)
+	if text != "" {
+		items = append(items, wechatMsgItem{
+			Type:     1,
+			TextItem: &wechatTextItem{Text: text},
+		})
+	}
+	for _, imageURL := range imageURLs {
+		items = append(items, wechatMsgItem{
+			Type: 2,
+			Image: &wechatImageItem{
+				URL: imageURL,
+			},
+		})
+	}
+	if fallbackText != "" {
+		if text == "" {
+			items = append([]wechatMsgItem{{
+				Type:     1,
+				TextItem: &wechatTextItem{Text: fallbackText},
+			}}, items...)
+		} else {
+			items = append(items, wechatMsgItem{
+				Type:     1,
+				TextItem: &wechatTextItem{Text: fallbackText},
+			})
+		}
+	}
+	if len(items) == 0 {
+		items = append(items, wechatMsgItem{
+			Type:     1,
+			TextItem: &wechatTextItem{Text: ""},
+		})
+	}
+
 	req := wechatSendMsgReq{
 		BaseInfo: wechatBaseInfo{ChannelVersion: "1.0.0"},
 		Message: wechatSendMsg{
@@ -122,7 +163,7 @@ func (w *WeChatChannel) Send(chatID string, msg OutboundMessage) error {
 			FromUserID:   botID,
 			MsgType:      2,
 			MsgState:     2,
-			Items:        []wechatMsgItem{{Type: 1, TextItem: &wechatTextItem{Text: msg.Text}}},
+			Items:        items,
 			ClientID:     clientID,
 			ContextToken: msg.ContextToken,
 		},
@@ -136,7 +177,6 @@ func (w *WeChatChannel) Send(chatID string, msg OutboundMessage) error {
 		ctx = context.Background()
 	}
 	if err := w.doRequest(ctx, http.MethodPost, "/ilink/bot/sendmessage", req, &resp); err != nil {
-		log.Printf("[wechat] send error: %v", err)
 		return fmt.Errorf("wechat: send: %w", err)
 	}
 	if resp.Ret != 0 {
@@ -178,7 +218,6 @@ func (w *WeChatChannel) pollLoop(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			log.Printf("[wechat] poll error: %v", err)
 			log.Printf("[wechat] getUpdates error: %v, retrying in %v", err, backoff)
 			select {
 			case <-ctx.Done():
@@ -233,9 +272,6 @@ func (w *WeChatChannel) pollLoop(ctx context.Context) {
 			w.mu.Unlock()
 			w.saveCredentials()
 		}
-		if len(resp.Messages) > 0 {
-			log.Printf("[wechat] received %d messages", len(resp.Messages))
-		}
 
 		w.mu.Lock()
 		handler := w.handler
@@ -260,17 +296,30 @@ func (w *WeChatChannel) pollLoop(ctx context.Context) {
 			}
 
 			text := extractText(msg.Items)
-			if text == "" {
+			attachments := extractAttachments(msg.Items)
+			if text == "" && len(attachments) == 0 {
 				continue
 			}
 
 			if handler != nil {
+				accountID := msg.ToUserID
+				if accountID == "" {
+					w.mu.Lock()
+					accountID = w.botID
+					w.mu.Unlock()
+				}
+				peerID := msg.FromUserID
 				handler(InboundMessage{
 					ChannelName:  "wechat",
-					ChatID:       msg.FromUserID,
-					UserID:       msg.FromUserID,
+					AccountID:    accountID,
+					ChatID:       peerID,
+					PeerKind:     "dm",
+					PeerID:       peerID,
+					MessageID:    fmt.Sprintf("%d", msg.MessageID),
+					UserID:       peerID,
 					Text:         text,
 					ContextToken: msg.ContextToken,
+					Attachments:  attachments,
 				})
 			}
 		}
@@ -336,10 +385,7 @@ func (w *WeChatChannel) qrLogin(ctx context.Context) error {
 			return fmt.Errorf("get qr code: %w", err)
 		}
 
-		log.Printf("[wechat] ========================================")
-		log.Printf("[wechat] Scan this QR code to login WeChat:")
-		log.Printf("[wechat] %s", qrResp.ImageContent)
-		log.Printf("[wechat] ========================================")
+		log.Printf("[wechat] scan QR code to login: %s", qrResp.ImageContent)
 
 		// Poll for QR code status.
 		pollURL := fmt.Sprintf("/ilink/bot/get_qrcode_status?qrcode=%s", qrResp.QRCodeID)
@@ -353,7 +399,6 @@ func (w *WeChatChannel) qrLogin(ctx context.Context) error {
 
 			var statusResp wechatQRStatusResp
 			if err := w.doRequest(ctx, http.MethodGet, pollURL, nil, &statusResp); err != nil {
-				log.Printf("[wechat] qr status poll error: %v", err)
 				time.Sleep(2 * time.Second)
 				continue
 			}
@@ -371,10 +416,10 @@ func (w *WeChatChannel) qrLogin(ctx context.Context) error {
 				w.saveCredentials()
 				return nil
 			case "expired":
-				log.Println("[wechat] QR code expired, generating new one...")
+				log.Println("[wechat] QR code expired, generating a new one")
 				expired = true
 			case "scanned":
-				log.Println("[wechat] QR code scanned, waiting for confirmation...")
+				log.Println("[wechat] QR code scanned, waiting for confirmation")
 			default:
 				// "wait" or other — keep polling.
 			}
@@ -420,8 +465,6 @@ func (w *WeChatChannel) saveCredentials() {
 	path := filepath.Join(w.credsDir, "wechat_credentials.json")
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		log.Printf("[wechat] failed to save credentials: %v", err)
-	} else {
-		log.Printf("[wechat] credentials saved to %s", path)
 	}
 }
 
@@ -448,9 +491,6 @@ func (w *WeChatChannel) loadCredentials() {
 	if creds.SyncBuf != "" {
 		w.syncBuf = creds.SyncBuf
 	}
-	if w.botToken != "" {
-		log.Printf("[wechat] loaded saved credentials from %s", path)
-	}
 }
 
 func resolveWeChatCredentialsDir(credsDir string) string {
@@ -473,6 +513,121 @@ func extractText(items []wechatMsgItem) string {
 		}
 	}
 	return text
+}
+
+func extractAttachments(items []wechatMsgItem) []Attachment {
+	var attachments []Attachment
+	for _, item := range items {
+		if item.Image == nil || strings.TrimSpace(item.Image.URL) == "" {
+			continue
+		}
+		url := strings.TrimSpace(item.Image.URL)
+		filename := attachmentFilenameFromURL(url)
+		attachments = append(attachments, Attachment{
+			Type:     "image",
+			Filename: filename,
+			MimeType: mimeTypeForFilename(filename),
+			URL:      url,
+		})
+	}
+	return attachments
+}
+
+func normalizeWeChatOutbound(text string, attachments []Attachment) (string, []string, string) {
+	cleanedText, markdownImageURLs := extractMarkdownImageURLs(text)
+
+	imageURLs := make([]string, 0, len(markdownImageURLs)+len(attachments))
+	seen := make(map[string]struct{}, len(markdownImageURLs)+len(attachments))
+	addImageURL := func(raw string) {
+		url := strings.TrimSpace(raw)
+		if url == "" {
+			return
+		}
+		if _, ok := seen[url]; ok {
+			return
+		}
+		seen[url] = struct{}{}
+		imageURLs = append(imageURLs, url)
+	}
+	for _, url := range markdownImageURLs {
+		addImageURL(url)
+	}
+
+	var unsupported []string
+	for _, attachment := range attachments {
+		switch {
+		case strings.EqualFold(attachment.Type, "image") && strings.TrimSpace(attachment.URL) != "":
+			addImageURL(attachment.URL)
+		case strings.TrimSpace(attachment.URL) != "":
+			unsupported = append(unsupported, describeUnsupportedAttachment(attachment))
+		case len(attachment.Data) > 0 || strings.TrimSpace(attachment.Path) != "":
+			unsupported = append(unsupported, describeUnsupportedAttachment(attachment))
+		default:
+			unsupported = append(unsupported, describeUnsupportedAttachment(attachment))
+		}
+	}
+
+	fallbackText := ""
+	if len(unsupported) > 0 {
+		fallbackText = "Attachments not sent: " + strings.Join(unsupported, ", ")
+	}
+
+	return strings.TrimSpace(cleanedText), imageURLs, fallbackText
+}
+
+func extractMarkdownImageURLs(text string) (string, []string) {
+	if strings.TrimSpace(text) == "" {
+		return "", nil
+	}
+	matches := wechatMarkdownImageRe.FindAllStringSubmatch(text, -1)
+	if len(matches) == 0 {
+		return text, nil
+	}
+
+	imageURLs := make([]string, 0, len(matches))
+	for _, match := range matches {
+		if len(match) > 1 {
+			imageURLs = append(imageURLs, match[1])
+		}
+	}
+
+	cleaned := wechatMarkdownImageRe.ReplaceAllString(text, "")
+	cleaned = strings.ReplaceAll(cleaned, "\n\n\n", "\n\n")
+	cleaned = strings.ReplaceAll(cleaned, "  ", " ")
+	cleaned = strings.TrimSpace(cleaned)
+	return cleaned, imageURLs
+}
+
+func describeUnsupportedAttachment(attachment Attachment) string {
+	if name := strings.TrimSpace(attachment.Filename); name != "" {
+		return filepath.Base(name)
+	}
+	if path := strings.TrimSpace(attachment.Path); path != "" {
+		return filepath.Base(path)
+	}
+	if url := strings.TrimSpace(attachment.URL); url != "" {
+		return filepath.Base(url)
+	}
+	if attachment.Type != "" {
+		return attachment.Type
+	}
+	return "attachment"
+}
+
+func attachmentFilenameFromURL(url string) string {
+	base := filepath.Base(strings.SplitN(url, "?", 2)[0])
+	base = strings.TrimSpace(base)
+	if base == "" || base == "." || base == "/" {
+		return "wechat-image.png"
+	}
+	return base
+}
+
+func mimeTypeForFilename(name string) string {
+	if value := mime.TypeByExtension(strings.ToLower(filepath.Ext(name))); value != "" {
+		return value
+	}
+	return "image/png"
 }
 
 // newUUID generates a UUID v4 string without external dependencies.

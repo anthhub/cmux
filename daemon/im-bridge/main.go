@@ -104,13 +104,17 @@ func main() {
 
 	// Setup session manager
 	// TODO: pass instances to SessionManager when it supports multi-instance routing
-	sessionMgr := bridge.NewSessionManager(ctx, cmuxClient, mgr, cfg.AI)
+	sessionMgr := bridge.NewSessionManagerWithConfig(ctx, cmuxClient, mgr, cfg)
 
 	// Route all IM messages to session manager
 	mgr.OnMessage(func(msg channels.InboundMessage) {
 		// Check user whitelist
 		if !cfg.IsUserAllowed(msg.UserID) {
 			log.Printf("[main] unauthorized user %s, ignoring", msg.UserID)
+			return
+		}
+		if msg.ChannelName == "wechat" && len(cfg.WeChat.OwnerIDs) > 0 && !containsString(cfg.WeChat.OwnerIDs, msg.UserID) {
+			log.Printf("[main] unauthorized wechat owner %s, ignoring", msg.UserID)
 			return
 		}
 		sessionMgr.HandleMessage(msg)
@@ -131,4 +135,13 @@ func main() {
 	log.Println("[main] shutting down...")
 	mgr.Stop()
 	log.Println("[main] stopped")
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }

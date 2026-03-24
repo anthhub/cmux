@@ -27,19 +27,25 @@ type IMPresenter struct {
 	chatID       string
 	contextToken string
 	verbose      bool
+	buffered     bool
 
 	// onControlRequest is called (without the presenter lock held) when a
 	// control_request event is received. The caller can use this to update
 	// session state (e.g., setPendingApproval).
 	onControlRequest func(event StreamEvent)
 
-	mu            sync.Mutex
-	buffer        strings.Builder
-	parts         []presentedPart
-	typingStop    func()
-	lastFlush     time.Time
-	sawTextDelta  bool
-	lastSentChars int
+	mu               sync.Mutex
+	buffer           strings.Builder
+	parts            []presentedPart
+	typingStop       func()
+	placeholderTimer *time.Timer
+	placeholderText  string
+	placeholderDelay time.Duration
+	placeholderSent  bool
+	finished         bool
+	lastFlush        time.Time
+	sawTextDelta     bool
+	lastSentChars    int
 }
 
 // NewIMPresenter creates a new presenter for one chat turn.
@@ -53,41 +59,70 @@ func NewIMPresenter(channel *channels.Manager, channelName, chatID, contextToken
 	}
 }
 
+// SetBufferedMode switches the presenter into final-message mode and optionally
+// schedules a single placeholder message if no result arrives quickly.
+func (p *IMPresenter) SetBufferedMode(placeholder string, delay time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.buffered = true
+	p.placeholderText = strings.TrimSpace(placeholder)
+	p.placeholderDelay = delay
+	p.placeholderSent = false
+	p.finished = false
+	p.stopPlaceholderTimerLocked()
+	p.ensurePlaceholderTimerLocked()
+}
+
 // HandleEvent applies one stream event.
 func (p *IMPresenter) HandleEvent(event StreamEvent) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if p.buffered && !p.finished {
+		switch event.Type {
+		case StreamEventText, StreamEventThinking, StreamEventToolUse, StreamEventToolResult:
+			p.ensurePlaceholderTimerLocked()
+		}
+	}
+
 	switch event.Type {
 	case StreamEventText:
+		if p.finished {
+			return
+		}
 		if event.Delta {
 			p.sawTextDelta = true
 			p.ensureTypingLocked()
+			p.ensurePlaceholderTimerLocked()
 			p.buffer.WriteString(event.Content)
 		} else if !p.sawTextDelta && event.Content != "" {
 			p.ensureTypingLocked()
+			p.ensurePlaceholderTimerLocked()
 			p.buffer.Reset()
+			p.buffer.WriteString(event.Content)
+		} else if event.Content != "" {
+			p.ensurePlaceholderTimerLocked()
 			p.buffer.WriteString(event.Content)
 		}
 		p.maybeFlushLocked(false)
 	case StreamEventThinking:
 		if p.verbose && strings.TrimSpace(event.Content) != "" {
-			p.sendStandaloneLocked("Thinking:\n" + strings.TrimSpace(event.Content))
+			p.sendStandalone("Thinking:\n" + strings.TrimSpace(event.Content))
 		}
 	case StreamEventToolUse:
 		if p.verbose && strings.TrimSpace(event.Content) != "" {
-			p.sendStandaloneLocked("Tool:\n" + strings.TrimSpace(event.Content))
+			p.sendStandalone("Tool:\n" + strings.TrimSpace(event.Content))
 		}
 	case StreamEventToolResult:
 		if p.verbose && strings.TrimSpace(event.Content) != "" {
-			p.sendStandaloneLocked("Tool Result:\n" + strings.TrimSpace(event.Content))
+			p.sendStandalone("Tool Result:\n" + strings.TrimSpace(event.Content))
 		}
 	case StreamEventControlRequest:
 		message := strings.TrimSpace(event.Content)
 		if message == "" {
 			message = "Approval required. Use /approve or /deny."
 		}
-		p.sendStandaloneLocked(message)
+		p.sendStandalone(message)
 		// Invoke callback outside the lock to avoid deadlock
 		cb := p.onControlRequest
 		if cb != nil {
@@ -97,9 +132,11 @@ func (p *IMPresenter) HandleEvent(event StreamEvent) {
 		}
 	case StreamEventError:
 		if strings.TrimSpace(event.Content) != "" {
-			p.sendStandaloneLocked("Error: " + strings.TrimSpace(event.Content))
+			p.sendStandalone("Error: " + strings.TrimSpace(event.Content))
 		}
 	case StreamEventResult:
+		p.finished = true
+		p.stopPlaceholderTimerLocked()
 		p.maybeFlushLocked(true)
 	}
 }
@@ -108,6 +145,8 @@ func (p *IMPresenter) HandleEvent(event StreamEvent) {
 func (p *IMPresenter) Close() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.finished = true
+	p.stopPlaceholderTimerLocked()
 	p.maybeFlushLocked(true)
 	p.stopTypingLocked()
 }
@@ -118,15 +157,39 @@ func (p *IMPresenter) maybeFlushLocked(force bool) {
 		return
 	}
 
+	if p.buffered && !force {
+		return
+	}
+
 	if !force {
 		if time.Since(p.lastFlush) < streamFlushInterval && len(text)-p.lastSentChars < streamFlushChars {
 			return
 		}
 	}
 
-	p.flushLocked(text)
+	if p.buffered {
+		p.flushBufferedLocked(text)
+	} else {
+		p.flushLocked(text)
+	}
 	p.lastFlush = time.Now()
 	p.lastSentChars = len(text)
+}
+
+func (p *IMPresenter) flushBufferedLocked(text string) {
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+	parts := splitForIM(text, p.channel.MaxMessageLength(p.channelName))
+	for _, partText := range parts {
+		_ = p.channel.Send(p.channelName, p.chatID, channels.OutboundMessage{
+			Text:         partText,
+			Format:       "text",
+			ContextToken: p.contextToken,
+		})
+	}
+	p.buffer.Reset()
+	p.parts = nil
 }
 
 func (p *IMPresenter) flushLocked(text string) {
@@ -173,6 +236,42 @@ func (p *IMPresenter) ensureTypingLocked() {
 	}
 }
 
+func (p *IMPresenter) ensurePlaceholderTimerLocked() {
+	if !p.buffered || p.placeholderSent || p.placeholderTimer != nil || p.placeholderDelay <= 0 || p.placeholderText == "" {
+		return
+	}
+
+	placeholder := p.placeholderText
+	delay := p.placeholderDelay
+	p.placeholderTimer = time.AfterFunc(delay, func() {
+		p.mu.Lock()
+		if p.finished || p.placeholderSent || p.buffer.Len() == 0 {
+			p.placeholderTimer = nil
+			p.mu.Unlock()
+			return
+		}
+		p.placeholderSent = true
+		p.placeholderTimer = nil
+		p.mu.Unlock()
+
+		_ = p.channel.Send(p.channelName, p.chatID, channels.OutboundMessage{
+			Text:         placeholder,
+			Format:       "text",
+			ContextToken: p.contextToken,
+		})
+	})
+}
+
+func (p *IMPresenter) stopPlaceholderTimerLocked() {
+	if p.placeholderTimer == nil {
+		return
+	}
+	if !p.placeholderTimer.Stop() {
+		// Timer may already be firing; callback will observe finished state.
+	}
+	p.placeholderTimer = nil
+}
+
 func (p *IMPresenter) stopTypingLocked() {
 	if p.typingStop != nil {
 		p.typingStop()
@@ -180,7 +279,7 @@ func (p *IMPresenter) stopTypingLocked() {
 	}
 }
 
-func (p *IMPresenter) sendStandaloneLocked(text string) {
+func (p *IMPresenter) sendStandalone(text string) {
 	if strings.TrimSpace(text) == "" {
 		return
 	}

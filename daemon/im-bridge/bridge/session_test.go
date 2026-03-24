@@ -444,15 +444,15 @@ func TestHandleResetSession_SendsCtrlCAndRelaunches(t *testing.T) {
 
 	sm.handleResetSession(agent, channels.InboundMessage{ChannelName: "test", ChatID: "chat-1"})
 
-	// Should have sent Ctrl+C then the claude stream-json command
-	if len(sentTexts) < 2 {
-		t.Fatalf("expected at least 2 send_text calls, got %d", len(sentTexts))
+	// Should send Ctrl+C and rely on the next turn to invoke Claude print mode.
+	if len(sentTexts) < 1 {
+		t.Fatalf("expected at least 1 send_text call, got %d", len(sentTexts))
 	}
 	if sentTexts[0] != "\x03" {
 		t.Fatalf("first send_text = %q, want ctrl-c", sentTexts[0])
 	}
-	if !strings.HasPrefix(sentTexts[1], "claude -p --output-format stream-json") {
-		t.Fatalf("second send_text = %q, want claude stream-json command", sentTexts[1])
+	if len(sentTexts) > 1 {
+		t.Fatalf("unexpected extra send_text after reset: %q", sentTexts[1])
 	}
 
 	// Provider session ID should be cleared

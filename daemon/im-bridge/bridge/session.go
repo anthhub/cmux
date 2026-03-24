@@ -17,9 +17,9 @@ import (
 )
 
 const (
-	defaultAgentName   = "default"
-	defaultSessionName = "default"
+	defaultSessionName = "main"
 	maxFallbackPreview = 3500
+	singleOwnerUserID  = "__owner__"
 )
 
 // UsageSnapshot tracks the latest token usage reported for a session.
@@ -57,6 +57,9 @@ type Session struct {
 	ID          string
 	SurfaceID   string
 	Name        string
+	RouteKey    string
+	AgentID     string
+	WorkspaceID string
 	SurfaceType string
 
 	AgentType         string
@@ -66,6 +69,8 @@ type Session struct {
 	Verbose           bool
 	ProviderSessionID string
 	PermissionMode    string
+	Workdir           string
+	ExtraArgs         []string
 	PreviousModel     string
 	PendingApproval   string
 	LastUsage         UsageSnapshot
@@ -82,7 +87,11 @@ type SessionManager struct {
 	users            map[string]*UserState
 	cmux             *CmuxClient
 	channel          *channels.Manager
+	state            *GatewayStateStore
+	mediaDir         string
 	aiCfg            config.AIConfig
+	agentDefs        map[string]AgentDefinition
+	defaultAgentID   string
 	defaultAgentType string
 	presenter        *IMPresenter
 	mu               sync.RWMutex
@@ -90,19 +99,62 @@ type SessionManager struct {
 
 // NewSessionManager creates a new session manager.
 func NewSessionManager(ctx context.Context, cmux *CmuxClient, channel *channels.Manager, ai config.AIConfig) *SessionManager {
-	defaultType := normalizeAgentType(ai.DefaultAgent)
-	log.Printf("[session] config default_agent=%q normalized=%q", ai.DefaultAgent, defaultType)
-	if defaultType == "" {
-		defaultType = AgentTypeClaude
+	cfg := &config.Config{AI: ai, DefaultAgent: ai.DefaultAgent}
+	return NewSessionManagerWithConfig(ctx, cmux, channel, cfg)
+}
+
+// NewSessionManagerWithConfig creates a new session manager using the full gateway config.
+func NewSessionManagerWithConfig(ctx context.Context, cmux *CmuxClient, channel *channels.Manager, cfg *config.Config) *SessionManager {
+	if cfg == nil {
+		cfg = &config.Config{}
 	}
-	log.Printf("[session] using defaultAgentType=%q", defaultType)
+
+	defaultAgentID := normalizeKey(cfg.ResolvedDefaultAgent())
+	if defaultAgentID == "" {
+		defaultAgentID = AgentTypeClaude
+	}
+	agentDefs := resolveAgentDefinitions(cfg)
+	defaultDef, ok := agentDefs[defaultAgentID]
+	if !ok {
+		defaultDef = agentDefs[AgentTypeClaude]
+		defaultAgentID = defaultDef.ID
+	}
+
+	defaultType := normalizeAgentType(cfg.AI.DefaultAgent)
+	log.Printf("[session] config default_agent=%q normalized=%q", cfg.ResolvedDefaultAgent(), defaultType)
+	if defaultType == "" {
+		defaultType = defaultDef.Provider
+	}
+	log.Printf("[session] using defaultAgent=%q defaultAgentType=%q", defaultAgentID, defaultType)
+
+	var stateStore *GatewayStateStore
+	statePath := strings.TrimSpace(cfg.Gateway.StatePath)
+	if statePath != "" {
+		var err error
+		stateStore, err = OpenGatewayStateStore(statePath)
+		if err != nil {
+			log.Printf("[session] failed to open state store %q: %v", statePath, err)
+		}
+	}
+	if stateStore != nil {
+		if persisted, err := stateStore.DefaultAgent(); err == nil && normalizeKey(persisted) != "" {
+			if persistedDef, ok := agentDefs[normalizeKey(persisted)]; ok {
+				defaultAgentID = persistedDef.ID
+				defaultType = persistedDef.Provider
+			}
+		}
+	}
 
 	return &SessionManager{
 		ctx:              ctx,
 		users:            make(map[string]*UserState),
 		cmux:             cmux,
 		channel:          channel,
-		aiCfg:            ai,
+		state:            stateStore,
+		mediaDir:         strings.TrimSpace(cfg.Gateway.MediaDir),
+		aiCfg:            cfg.AI,
+		agentDefs:        agentDefs,
+		defaultAgentID:   defaultAgentID,
 		defaultAgentType: defaultType,
 		presenter:        nil, // initialized per-turn in watchOutput
 	}
@@ -111,12 +163,13 @@ func NewSessionManager(ctx context.Context, cmux *CmuxClient, channel *channels.
 // HandleMessage processes one inbound IM message.
 func (sm *SessionManager) HandleMessage(msg channels.InboundMessage) {
 	text := strings.TrimSpace(msg.Text)
-	if text == "" {
+	if text == "" && len(msg.Attachments) == 0 {
 		return
 	}
 
-	user := sm.getOrCreateUser(msg.UserID)
+	user := sm.getOrCreateUser(singleOwnerUserID)
 	isNewUser := user.activeAgent() == nil
+	sm.selectDefaultAgent(user)
 	agent, err := sm.ensureActiveAgent(user)
 	if err != nil {
 		log.Printf("[session] failed to ensure active agent for %s: %v", msg.UserID, err)
@@ -138,17 +191,38 @@ func (sm *SessionManager) HandleMessage(msg channels.InboundMessage) {
 		return
 	}
 
+	if agent.Name != sm.defaultAgentID {
+		if restored, ok := user.switchAgent(sm.defaultAgentID); ok {
+			agent = restored
+		}
+	}
+
 	session := agent.ActiveSession()
 	if session == nil {
 		sm.reply(msg, "No active session. Use /new to create one.")
 		return
 	}
 
+	if agent, session, err = sm.ensureMainSession(user, agent); err != nil {
+		sm.reply(msg, "Error: "+err.Error())
+		return
+	}
+
+	prompt, err := sm.prepareInboundPrompt(msg)
+	if err != nil {
+		sm.reply(msg, "Error preparing message: "+err.Error())
+		return
+	}
+
 	switch session.agentType() {
 	case AgentTypeShell:
+		if len(msg.Attachments) > 0 {
+			sm.reply(msg, "Attachments are currently supported only for AI sessions.")
+			return
+		}
 		sm.handleBash(agent, msg, text)
 	default:
-		sm.handleAIInput(agent, session, msg, text)
+		sm.handleAIInput(agent, session, msg, prompt)
 	}
 }
 
@@ -158,6 +232,12 @@ func (sm *SessionManager) handleCommand(user *UserState, agent *Agent, msg chann
 	args := fields[1:]
 
 	switch command {
+	case "cc":
+		sm.handleOneShotAgentPrompt(user, msg, strings.TrimSpace(strings.TrimPrefix(text, "/cc")), AgentTypeClaude)
+	case "cx":
+		sm.handleOneShotAgentPrompt(user, msg, strings.TrimSpace(strings.TrimPrefix(text, "/cx")), AgentTypeCodex)
+	case "claude", "codex", "shell":
+		sm.handleDefaultAgentAlias(user, msg, command, args)
 	case "help", "commands":
 		sm.handleHelp(msg)
 	case "status":
@@ -219,6 +299,69 @@ func (sm *SessionManager) handleCommand(user *UserState, agent *Agent, msg chann
 	}
 }
 
+func (sm *SessionManager) handleDefaultAgentAlias(user *UserState, msg channels.InboundMessage, rawAgentID string, args []string) {
+	agentID := normalizeAgentType(rawAgentID)
+	if agentID == "" {
+		sm.reply(msg, "Unknown agent: "+rawAgentID)
+		return
+	}
+	if len(args) > 0 {
+		sm.reply(msg, fmt.Sprintf("Usage: /%s", agentID))
+		return
+	}
+
+	agent, err := sm.ensureNamedAgent(user, agentID)
+	if err != nil {
+		sm.reply(msg, "Error: "+err.Error())
+		return
+	}
+	user.switchAgent(agent.Name)
+	sm.setDefaultAgent(agent.Name)
+	if workspaceID := agent.workspaceID(); workspaceID != "" {
+		if err := sm.cmux.SelectWorkspace(workspaceID); err != nil {
+			log.Printf("[session] failed to select workspace for %s: %v", agent.Name, err)
+		}
+	}
+	sm.reply(msg, "Default agent set to: "+agent.Name)
+}
+
+func (sm *SessionManager) handleOneShotAgentPrompt(user *UserState, msg channels.InboundMessage, raw string, agentID string) {
+	body := strings.TrimSpace(raw)
+	if body == "" {
+		sm.reply(msg, fmt.Sprintf("Usage: /%s <message>", map[string]string{
+			AgentTypeClaude: "cc",
+			AgentTypeCodex:  "cx",
+			AgentTypeShell:  "shell",
+		}[normalizeAgentType(agentID)]))
+		return
+	}
+
+	agent, err := sm.ensureNamedAgent(user, agentID)
+	if err != nil {
+		sm.reply(msg, "Error: "+err.Error())
+		return
+	}
+	_, session, err := sm.ensureMainSession(user, agent)
+	if err != nil {
+		sm.reply(msg, "Error: "+err.Error())
+		return
+	}
+
+	promptMsg := msg
+	promptMsg.Text = body
+	prompt, err := sm.prepareInboundPrompt(promptMsg)
+	if err != nil {
+		sm.reply(msg, "Error preparing message: "+err.Error())
+		return
+	}
+	switch session.agentType() {
+	case AgentTypeShell:
+		sm.handleBash(agent, msg, body)
+	default:
+		sm.handleAIInput(agent, session, msg, prompt)
+	}
+}
+
 func (sm *SessionManager) getOrCreateUser(userID string) *UserState {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -235,10 +378,264 @@ func (sm *SessionManager) getOrCreateUser(userID string) *UserState {
 	return user
 }
 
+func (sm *SessionManager) selectDefaultAgent(user *UserState) {
+	if user == nil {
+		return
+	}
+	def := sm.agentDefinition(sm.defaultAgentID)
+	user.ensureAgent(def.ID, def.Provider)
+}
+
+func (sm *SessionManager) currentDefaultAgentID() string {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	if sm.defaultAgentID == "" {
+		return AgentTypeClaude
+	}
+	return sm.defaultAgentID
+}
+
+func (sm *SessionManager) setDefaultAgent(agentID string) {
+	agentID = normalizeKey(agentID)
+	if agentID == "" {
+		return
+	}
+	sm.mu.Lock()
+	sm.defaultAgentID = agentID
+	sm.defaultAgentType = sm.agentDefinition(agentID).Provider
+	sm.mu.Unlock()
+	if sm.state != nil {
+		if err := sm.state.SetDefaultAgent(agentID); err != nil {
+			log.Printf("[session] failed to persist default agent %q: %v", agentID, err)
+		}
+	}
+}
+
+func (sm *SessionManager) agentDefinition(agentID string) AgentDefinition {
+	id := normalizeKey(agentID)
+	if id == "" {
+		id = AgentTypeClaude
+	}
+	if def, ok := sm.agentDefs[id]; ok {
+		return def
+	}
+	return AgentDefinition{
+		ID:       id,
+		Provider: effectiveAgentType(id, AgentTypeClaude),
+		Workdir:  sm.aiCfg.Workdir,
+	}
+}
+
+func (sm *SessionManager) ensureNamedAgent(user *UserState, agentID string) (*Agent, error) {
+	def := sm.agentDefinition(agentID)
+	agent := user.ensureAgent(def.ID, def.Provider)
+
+	created, err := sm.ensureAgentWorkspace(singleOwnerUserID, agent)
+	if err != nil {
+		return nil, err
+	}
+	if err := sm.syncAgentSessions(agent); err != nil {
+		return nil, err
+	}
+
+	if created {
+		session := agent.ActiveSession()
+		if session != nil {
+			if err := sm.cmux.RenameSurface(agent.workspaceID(), session.SurfaceID, defaultSessionName); err != nil {
+				log.Printf("[session] failed to rename default surface for agent %s: %v", agent.Name, err)
+			} else if err := sm.syncAgentSessions(agent); err != nil {
+				return nil, err
+			}
+			session = agent.ActiveSession()
+			if session != nil {
+				sm.applyAgentDefaults(agent, session)
+				if ShouldLaunchPersistentAgent(session) {
+					if err := LaunchAgentInTerminal(sm.cmux, agent.workspaceID(), session.SurfaceID, session, sm.aiCfg); err != nil {
+						log.Printf("[session] failed to launch agent in terminal for agent %s: %v", agent.Name, err)
+					}
+				}
+			}
+		}
+	}
+
+	if _, _, err := sm.ensureMainSession(user, agent); err != nil {
+		return nil, err
+	}
+	return agent, nil
+}
+
+func (sm *SessionManager) ensureMainSession(user *UserState, agent *Agent) (*Agent, *Session, error) {
+	if agent == nil {
+		var err error
+		agent, err = sm.ensureActiveAgent(user)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	if err := sm.syncAgentSessions(agent); err != nil {
+		return nil, nil, err
+	}
+
+	if session, ok := agent.SessionByName(defaultSessionName); ok {
+		agent.setActiveSession(session.ID)
+		sm.applyAgentDefaults(agent, session)
+		sm.persistSessionState(agent, session)
+		return agent, session, nil
+	}
+
+	if session := agent.ActiveSession(); session != nil {
+		sm.applyAgentDefaults(agent, session)
+		sm.persistSessionState(agent, session)
+		return agent, session, nil
+	}
+
+	surface, err := sm.cmux.CreateSurface(agent.workspaceID())
+	if err != nil {
+		return nil, nil, fmt.Errorf("create main session: %w", err)
+	}
+	if err := sm.cmux.RenameSurface(agent.workspaceID(), surface.ID, defaultSessionName); err != nil {
+		log.Printf("[session] failed to rename main surface for agent %s: %v", agent.Name, err)
+	}
+	if err := sm.syncAgentSessions(agent); err != nil {
+		return nil, nil, err
+	}
+	session, ok := agent.SessionByName(defaultSessionName)
+	if !ok {
+		session = agent.ActiveSession()
+	}
+	if session == nil {
+		return nil, nil, fmt.Errorf("main session missing for agent %s", agent.Name)
+	}
+	agent.setActiveSession(session.ID)
+	sm.applyAgentDefaults(agent, session)
+	if ShouldLaunchPersistentAgent(session) {
+		if err := LaunchAgentInTerminal(sm.cmux, agent.workspaceID(), session.SurfaceID, session, sm.aiCfg); err != nil {
+			log.Printf("[session] failed to launch main session for agent %s: %v", agent.Name, err)
+		}
+	}
+	sm.persistSessionState(agent, session)
+	return agent, session, nil
+}
+
+func (sm *SessionManager) applyAgentDefaults(agent *Agent, session *Session) {
+	if agent == nil || session == nil {
+		return
+	}
+	def := sm.agentDefinition(agent.Name)
+	session.RouteKey = sessionRouteKey(agent.Name, session.Name)
+	if strings.TrimSpace(session.AgentType) == "" {
+		session.setAgentType(def.Provider)
+	}
+
+	if strings.TrimSpace(session.Model) == "" && strings.TrimSpace(def.Model) != "" {
+		session.setModel(def.Model)
+	}
+	if strings.TrimSpace(session.Workdir) == "" && strings.TrimSpace(def.Workdir) != "" {
+		session.setWorkdir(def.Workdir)
+	}
+	if strings.TrimSpace(session.permissionMode()) == "" && strings.TrimSpace(def.PermissionMode) != "" {
+		session.setPermissionMode(def.PermissionMode)
+	}
+	if len(session.extraArgs()) == 0 && len(def.Args) > 0 {
+		session.setExtraArgs(def.Args)
+	}
+
+	if sm.state == nil {
+		return
+	}
+	persisted, err := sm.state.LoadSession(session.RouteKey)
+	if err != nil || persisted == nil {
+		return
+	}
+	if session.providerSessionID() == "" && persisted.ProviderSessionID != "" {
+		session.setProviderSessionID(persisted.ProviderSessionID)
+	}
+	if session.model() == "" && persisted.Model != "" {
+		session.setModel(persisted.Model)
+	}
+	if session.permissionMode() == "" && persisted.PermissionMode != "" {
+		session.setPermissionMode(persisted.PermissionMode)
+	}
+	if session.workdir() == "" && persisted.Workdir != "" {
+		session.setWorkdir(persisted.Workdir)
+	}
+	if session.effort() == "" && persisted.Effort != "" {
+		session.setEffort(persisted.Effort)
+	}
+	if !session.verbose() && persisted.Verbose {
+		session.setVerbose(true)
+	}
+	if !session.fast() && persisted.Fast {
+		session.setFast(true)
+	}
+}
+
+func (sm *SessionManager) persistSessionState(agent *Agent, session *Session) {
+	if sm.state == nil || agent == nil || session == nil {
+		return
+	}
+	routeKey := session.RouteKey
+	if routeKey == "" {
+		routeKey = sessionRouteKey(agent.Name, session.Name)
+	}
+	err := sm.state.SaveSession(PersistedSessionState{
+		SessionKey:        routeKey,
+		AgentID:           normalizeKey(agent.Name),
+		WorkspaceID:       agent.workspaceID(),
+		SurfaceID:         session.SurfaceID,
+		Provider:          session.agentType(),
+		ProviderSessionID: session.providerSessionID(),
+		Model:             session.model(),
+		PermissionMode:    session.permissionMode(),
+		Workdir:           session.workdir(),
+		Effort:            session.effort(),
+		Verbose:           session.verbose(),
+		Fast:              session.fast(),
+	})
+	if err != nil {
+		log.Printf("[session] failed to persist session state %s: %v", routeKey, err)
+	}
+}
+
+func (sm *SessionManager) persistSessionSnapshot(session *Session) {
+	if sm.state == nil || session == nil || session.RouteKey == "" {
+		return
+	}
+	err := sm.state.SaveSession(PersistedSessionState{
+		SessionKey:        session.RouteKey,
+		AgentID:           normalizeKey(session.AgentID),
+		WorkspaceID:       session.WorkspaceID,
+		SurfaceID:         session.SurfaceID,
+		Provider:          session.agentType(),
+		ProviderSessionID: session.providerSessionID(),
+		Model:             session.model(),
+		PermissionMode:    session.permissionMode(),
+		Workdir:           session.workdir(),
+		Effort:            session.effort(),
+		Verbose:           session.verbose(),
+		Fast:              session.fast(),
+	})
+	if err != nil {
+		log.Printf("[session] failed to persist session snapshot %s: %v", session.RouteKey, err)
+	}
+}
+
+func (sm *SessionManager) prepareInboundPrompt(msg channels.InboundMessage) (string, error) {
+	prepared, err := materializeAttachments(sm.mediaDir, msg.Attachments)
+	if err != nil {
+		return "", err
+	}
+	prompt := buildInboundPrompt(msg, prepared)
+	if strings.TrimSpace(prompt) == "" {
+		prompt = strings.TrimSpace(msg.Text)
+	}
+	return prompt, nil
+}
+
 func (sm *SessionManager) ensureActiveAgent(user *UserState) (*Agent, error) {
 	agent := user.activeAgent()
 	if agent == nil {
-		agent = user.ensureAgent(defaultAgentName, sm.defaultAgentType)
+		return sm.ensureNamedAgent(user, sm.currentDefaultAgentID())
 	}
 
 	created, err := sm.ensureAgentWorkspace(user.ID, agent)
@@ -257,7 +654,7 @@ func (sm *SessionManager) ensureActiveAgent(user *UserState) (*Agent, error) {
 			} else if err := sm.syncAgentSessions(agent); err != nil {
 				return nil, err
 			}
-			if session.agentType() != AgentTypeShell {
+			if ShouldLaunchPersistentAgent(session) {
 				if err := LaunchAgentInTerminal(sm.cmux, agent.workspaceID(), session.SurfaceID, session, sm.aiCfg); err != nil {
 					log.Printf("[session] failed to launch agent in terminal for agent %s: %v", agent.Name, err)
 				}
@@ -273,6 +670,7 @@ func (sm *SessionManager) ensureAgentWorkspace(userID string, agent *Agent) (boo
 	defer agent.workspaceEnsureMu.Unlock()
 
 	title := workspaceTitle(userID, agent.Name)
+	legacyTitle := legacyWorkspaceTitle(userID, agent.Name)
 	listings, err := sm.cmux.ListAllWorkspaces()
 	if err != nil {
 		workspaces, fallbackErr := sm.cmux.ListWorkspaces()
@@ -294,7 +692,8 @@ func (sm *SessionManager) ensureAgentWorkspace(userID string, agent *Agent) (boo
 	}
 
 	for _, listing := range listings {
-		if strings.TrimSpace(listing.Workspace.Title) == strings.TrimSpace(title) {
+		trimmed := strings.TrimSpace(listing.Workspace.Title)
+		if trimmed == strings.TrimSpace(title) || trimmed == strings.TrimSpace(legacyTitle) {
 			agent.setWorkspaceID(listing.Workspace.ID)
 			return false, nil
 		}
@@ -344,9 +743,13 @@ func (sm *SessionManager) syncAgentSessions(agent *Agent) error {
 
 		session.Name = sessionNameForSurface(surface, index)
 		session.SurfaceType = surface.Type
+		session.AgentID = normalizeKey(agent.Name)
+		session.WorkspaceID = workspaceID
 		if session.AgentType == "" {
 			session.AgentType = defaultType
 		}
+		session.RouteKey = sessionRouteKey(agent.Name, session.Name)
+		sm.applyAgentDefaults(agent, session)
 		sessions[session.ID] = session
 		order = append(order, session.ID)
 
@@ -404,11 +807,13 @@ func (sm *SessionManager) handleNewSession(agent *Agent, msg channels.InboundMes
 	sessionType := effectiveAgentType(provider, agent.defaultType())
 	if session := agent.ActiveSession(); session != nil {
 		session.setAgentType(sessionType)
-		if sessionType != AgentTypeShell {
+		sm.applyAgentDefaults(agent, session)
+		if ShouldLaunchPersistentAgent(session) {
 			if err := LaunchAgentInTerminal(sm.cmux, agent.workspaceID(), surface.ID, session, sm.aiCfg); err != nil {
 				log.Printf("[session] failed to launch agent in new session %s: %v", name, err)
 			}
 		}
+		sm.persistSessionState(agent, session)
 	}
 	sm.reply(msg, fmt.Sprintf("New session [%s] created (%s)", name, sessionType))
 }
@@ -525,14 +930,16 @@ func (sm *SessionManager) handleResetSession(agent *Agent, msg channels.InboundM
 	session.stopWatching()
 	// Send Ctrl+C to stop any running process, then relaunch the agent
 	_ = StopAgent(sm.cmux, agent.workspaceID(), session.SurfaceID)
-	if session.agentType() != AgentTypeShell {
+	session.setProviderSessionID("")
+	session.setPendingApproval("")
+	session.setLastUsage(UsageSnapshot{})
+	session.setRunningTurn(false)
+	if ShouldLaunchPersistentAgent(session) {
 		if err := LaunchAgentInTerminal(sm.cmux, agent.workspaceID(), session.SurfaceID, session, sm.aiCfg); err != nil {
 			log.Printf("[session] failed to relaunch agent after reset: %v", err)
 		}
 	}
-	session.setProviderSessionID("")
-	session.setPendingApproval("")
-	session.setLastUsage(UsageSnapshot{})
+	sm.persistSessionState(agent, session)
 	sm.reply(msg, "Reset session context: "+session.Name)
 }
 
@@ -557,6 +964,7 @@ func (sm *SessionManager) handleModelCommand(agent *Agent, msg channels.InboundM
 	}
 
 	session.setModel(strings.Join(args, " "))
+	sm.persistSessionState(agent, session)
 	sm.reply(msg, "Model set to: "+session.model()+". Use /reset to apply to running session.")
 }
 
@@ -589,6 +997,7 @@ func (sm *SessionManager) handleThinkCommand(agent *Agent, msg channels.InboundM
 		sm.reply(msg, "Usage: /think off|low|medium|high|max")
 		return
 	}
+	sm.persistSessionState(agent, session)
 	sm.reply(msg, "Thinking effort set to: "+value+". Use /reset to apply to running session.")
 }
 
@@ -642,6 +1051,7 @@ func (sm *SessionManager) handleFastCommand(agent *Agent, msg channels.InboundMe
 		sm.reply(msg, "Usage: /fast on|off")
 		return
 	}
+	sm.persistSessionState(agent, session)
 }
 
 func (sm *SessionManager) handleVerboseCommand(agent *Agent, msg channels.InboundMessage, args []string) {
@@ -664,6 +1074,7 @@ func (sm *SessionManager) handleVerboseCommand(agent *Agent, msg channels.Inboun
 		sm.reply(msg, "Usage: /verbose on|off")
 		return
 	}
+	sm.persistSessionState(agent, session)
 	sm.reply(msg, fmt.Sprintf("Verbose mode set to: %t", session.verbose()))
 }
 
@@ -724,13 +1135,24 @@ func (sm *SessionManager) handleAIInput(agent *Agent, session *Session, msg chan
 
 	ctx, cancel := context.WithCancel(sm.ctx)
 	session.setWatchCancel(cancel)
+	session.setRunningTurn(true)
 	go sm.watchOutput(ctx, agent.workspaceID(), session, msg.ChannelName, msg.ChatID, msg.ContextToken)
 
-	if err := sm.cmux.SendText(agent.workspaceID(), session.SurfaceID, prompt+"\n"); err != nil {
+	command, err := PrepareTurnCommand(session, prompt, sm.aiCfg, sm.mediaDir)
+	if err != nil {
 		session.stopWatching()
+		session.setRunningTurn(false)
+		sm.reply(msg, "Error preparing agent command: "+err.Error())
+		return
+	}
+
+	if err := sm.cmux.SendText(agent.workspaceID(), session.SurfaceID, command); err != nil {
+		session.stopWatching()
+		session.setRunningTurn(false)
 		sm.reply(msg, "Error sending to terminal: "+err.Error())
 		return
 	}
+	sm.persistSessionState(agent, session)
 }
 
 func (sm *SessionManager) handleBash(agent *Agent, msg channels.InboundMessage, command string) {
@@ -756,10 +1178,12 @@ func (sm *SessionManager) handleBash(agent *Agent, msg channels.InboundMessage, 
 
 	ctx, cancel := context.WithCancel(sm.ctx)
 	session.setWatchCancel(cancel)
+	session.setRunningTurn(true)
 	go sm.watchOutput(ctx, agent.workspaceID(), session, msg.ChannelName, msg.ChatID, msg.ContextToken)
 
 	if err := sm.cmux.SendText(agent.workspaceID(), session.SurfaceID, command+"\n"); err != nil {
 		session.stopWatching()
+		session.setRunningTurn(false)
 		sm.reply(msg, "Error sending to terminal: "+err.Error())
 		return
 	}
@@ -773,6 +1197,7 @@ func (sm *SessionManager) handleStop(agent *Agent, msg channels.InboundMessage) 
 	}
 
 	session.stopWatching()
+	session.setRunningTurn(false)
 	if err := StopAgent(sm.cmux, agent.workspaceID(), session.SurfaceID); err != nil {
 		sm.reply(msg, "Error sending stop signal: "+err.Error())
 		return
@@ -797,6 +1222,7 @@ func (sm *SessionManager) handleApprove(agent *Agent, msg channels.InboundMessag
 		return
 	}
 	session.setPendingApproval("")
+	sm.persistSessionState(agent, session)
 	sm.reply(msg, "✓ Approved.")
 }
 
@@ -817,6 +1243,7 @@ func (sm *SessionManager) handleDeny(agent *Agent, msg channels.InboundMessage) 
 		return
 	}
 	session.setPendingApproval("")
+	sm.persistSessionState(agent, session)
 	sm.reply(msg, "✗ Denied.")
 }
 
@@ -847,6 +1274,7 @@ func (sm *SessionManager) handlePermissionCommand(agent *Agent, msg channels.Inb
 	switch mode {
 	case "default", "plan", "bypassPermissions", "auto":
 		session.setPermissionMode(mode)
+		sm.persistSessionState(agent, session)
 		sm.reply(msg, "Permission mode set to: "+mode+". Use /reset to apply to running session.")
 	default:
 		sm.reply(msg, "Invalid permission mode: "+mode+"\nValid modes: default, plan, bypassPermissions, auto")
@@ -871,6 +1299,11 @@ func (sm *SessionManager) handleScreenshot(agent *Agent, msg channels.InboundMes
 			sm.reply(msg, "Error taking browser screenshot: "+err.Error())
 			return
 		}
+		if msg.ChannelName == "wechat" {
+			location := defaultString(shot.Path, "(path unavailable)")
+			sm.reply(msg, "Browser screenshot captured locally: "+location+"\nWeChat native image upload is not implemented yet.")
+			return
+		}
 
 		data, err := decodeOrReadScreenshot(shot.PNGBase64, shot.Path)
 		if err != nil {
@@ -892,6 +1325,10 @@ func (sm *SessionManager) handleScreenshot(agent *Agent, msg channels.InboundMes
 
 	shot, err := sm.cmux.DebugPanelSnapshot(session.SurfaceID, screenshotLabel(session.Name))
 	if err == nil {
+		if msg.ChannelName == "wechat" {
+			sm.reply(msg, "Terminal screenshot captured locally: "+defaultString(shot.Path, "(path unavailable)")+"\nWeChat native image upload is not implemented yet.")
+			return
+		}
 		data, readErr := os.ReadFile(shot.Path)
 		if readErr != nil {
 			sm.reply(msg, "Error reading terminal screenshot: "+readErr.Error())
@@ -1112,7 +1549,7 @@ func (sm *SessionManager) handleAgentCommand(user *UserState, msg channels.Inbou
 				} else {
 					_ = sm.syncAgentSessions(agent)
 				}
-				if session.agentType() != AgentTypeShell {
+				if ShouldLaunchPersistentAgent(session) {
 					if err := LaunchAgentInTerminal(sm.cmux, agent.workspaceID(), session.SurfaceID, session, sm.aiCfg); err != nil {
 						log.Printf("[session] failed to launch agent for new agent %s: %v", name, err)
 					}
@@ -1181,7 +1618,7 @@ func (sm *SessionManager) handleAgentCommand(user *UserState, msg channels.Inbou
 	case "close":
 		name := sanitizeName(strings.TrimSpace(strings.TrimPrefix(raw, fields[0])))
 		if name == "" {
-			name = defaultAgentName
+			name = sm.currentDefaultAgentID()
 		}
 		if strings.EqualFold(name, "all") {
 			for _, agent := range user.listAgents() {
@@ -1227,10 +1664,12 @@ func (sm *SessionManager) handleStatus(agent *Agent, msg channels.InboundMessage
 	}
 
 	sm.reply(msg, fmt.Sprintf(
-		"Agent: %s\nWorkspace: %s\nActive session: %s\nProvider: %s\nContext ID: %s\nVerbose: %t\nRunning: %t\nWatching shell: %t",
+		"Default agent: %s\nActive agent: %s\nWorkspace: %s\nActive session: %s\nRoute: %s\nProvider: %s\nContext ID: %s\nVerbose: %t\nRunning: %t\nWatching output: %t",
+		sm.currentDefaultAgentID(),
 		agent.Name,
 		agent.workspaceID(),
 		session.Name,
+		defaultString(session.RouteKey, sessionRouteKey(agent.Name, session.Name)),
 		session.agentType(),
 		defaultString(session.providerSessionID(), "(new)"),
 		session.verbose(),
@@ -1242,6 +1681,10 @@ func (sm *SessionManager) handleStatus(agent *Agent, msg channels.InboundMessage
 func (sm *SessionManager) handleHelp(msg channels.InboundMessage) {
 	help := `cmux IM Bridge Commands:
 
+/claude        Switch the default agent to Claude
+/codex         Switch the default agent to Codex
+/cc <message>  Send one message to Claude without switching default
+/cx <message>  Send one message to Codex without switching default
 /new [name] [--model claude|codex|shell]
 /list
 /switch <name>
@@ -1270,18 +1713,11 @@ func (sm *SessionManager) handleHelp(msg channels.InboundMessage) {
 /read [lines]
 /raw <method> [json]
 
-OpenClaw migration:
-/bash <cmd>  -> /bash <cmd> or ! <cmd>
-/stop        -> /stop
-/acp spawn   -> /agent new <name>
-/focus       -> /agent switch <name>
-/reset       -> /reset
-/model       -> /model
-/think high  -> /think high
+Plain text goes to the default agent's main session.
+/cc and /cx are one-shot prompts that do not change the default agent.
+In shell sessions, plain text runs in the terminal.`
 
-Plain text goes to the active AI session. In shell sessions, plain text runs in the terminal.`
-
-	help += "\n\nProvider notes:\n/think, /fast, /permission, /approve currently apply to Claude sessions only.\nUse /model for provider-specific Codex tuning."
+	help += "\n\nProvider notes:\n/think, /fast, /permission, /approve currently apply to Claude sessions only.\nClaude runs each turn through `claude -p --output-format stream-json` and resumes from the provider session id when available.\nCodex runs through `codex exec --json` and resumes from the provider session id when available."
 
 	sm.reply(msg, help)
 }
@@ -1290,10 +1726,17 @@ Plain text goes to the active AI session. In shell sessions, plain text runs in 
 // It is called by the presenter callback and by output_watcher for AI-mode sessions.
 func (sm *SessionManager) handleStreamEvent(session *Session, event StreamEvent) {
 	switch event.Type {
+	case StreamEventInit:
+		if event.SessionID != "" {
+			session.setProviderSessionID(event.SessionID)
+		} else if threadID, ok := event.Meta["thread_id"].(string); ok && threadID != "" {
+			session.setProviderSessionID(threadID)
+		}
 	case StreamEventControlRequest:
 		session.setPendingApproval(event.Content)
 		// Presenter already notified IM via HandleEvent
 	case StreamEventResult:
+		session.setRunningTurn(false)
 		if id, ok := event.Meta["session_id"].(string); ok && id != "" {
 			session.setProviderSessionID(id)
 		}
@@ -1311,6 +1754,7 @@ func (sm *SessionManager) handleStreamEvent(session *Session, event StreamEvent)
 			session.setLastUsage(snap)
 		}
 	}
+	sm.persistSessionSnapshot(session)
 }
 
 func (sm *SessionManager) teardownAgent(agent *Agent) {
@@ -1321,21 +1765,11 @@ func (sm *SessionManager) teardownAgent(agent *Agent) {
 }
 
 func (sm *SessionManager) sendWelcome(msg channels.InboundMessage) {
-	modeName := sm.defaultAgentType
-	switch modeName {
-	case AgentTypeClaude:
-		modeName = "Claude Code"
-	case AgentTypeCodex:
-		modeName = "Codex"
-	case AgentTypeShell:
-		modeName = "Shell"
-	}
-	sm.reply(msg, "👋 欢迎使用 cmux 终端助手！\n\n"+
-		"直接输入问题或指令，我会帮你完成。\n"+
-		"• ! command — 直接执行 shell 命令\n"+
-		"• /help — 查看所有命令\n"+
-		"• /new name --model shell — 创建 shell 会话\n\n"+
-		"当前模式："+modeName)
+	sm.reply(msg, "cmux IM bridge is ready.\n"+
+		"Plain text goes to the default agent main session.\n"+
+		"/claude or /codex switches the default agent.\n"+
+		"/cc and /cx send one-shot prompts.\n"+
+		"/help shows the full command list.")
 }
 
 func (sm *SessionManager) send(channelName, chatID string, msg channels.OutboundMessage) {
@@ -1579,6 +2013,12 @@ func (s *Session) isRunningTurn() bool {
 	return s.runningTurn
 }
 
+func (s *Session) setRunningTurn(value bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.runningTurn = value
+}
+
 func (s *Session) agentType() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1663,6 +2103,39 @@ func (s *Session) setPermissionMode(value string) {
 	s.PermissionMode = strings.TrimSpace(value)
 }
 
+func (s *Session) workdir() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return strings.TrimSpace(s.Workdir)
+}
+
+func (s *Session) setWorkdir(value string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Workdir = strings.TrimSpace(value)
+}
+
+func (s *Session) extraArgs() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]string, len(s.ExtraArgs))
+	copy(out, s.ExtraArgs)
+	return out
+}
+
+func (s *Session) setExtraArgs(args []string) {
+	cleaned := make([]string, 0, len(args))
+	for _, arg := range args {
+		arg = strings.TrimSpace(arg)
+		if arg != "" {
+			cleaned = append(cleaned, arg)
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ExtraArgs = cleaned
+}
+
 func (s *Session) pendingApproval() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1693,6 +2166,8 @@ func normalizeKey(name string) string {
 
 func sanitizeName(name string) string {
 	name = strings.TrimSpace(strings.ReplaceAll(name, "\n", " "))
+	name = strings.ReplaceAll(name, "/", "-")
+	name = strings.ReplaceAll(name, "\\", "-")
 	for strings.Contains(name, "  ") {
 		name = strings.ReplaceAll(name, "  ", " ")
 	}
@@ -1700,7 +2175,23 @@ func sanitizeName(name string) string {
 }
 
 func workspaceTitle(userID, agentName string) string {
+	return "OC/" + sanitizeName(agentName)
+}
+
+func legacyWorkspaceTitle(userID, agentName string) string {
 	return fmt.Sprintf("IM %s / %s", userID, agentName)
+}
+
+func sessionRouteKey(agentName, sessionName string) string {
+	agentKey := normalizeKey(agentName)
+	if agentKey == "" {
+		agentKey = AgentTypeClaude
+	}
+	sessionKey := normalizeKey(sessionName)
+	if sessionKey == "" {
+		sessionKey = defaultSessionName
+	}
+	return fmt.Sprintf("agent:%s:%s", agentKey, sessionKey)
 }
 
 func sessionNameForSurface(surface SurfaceInfo, index int) string {

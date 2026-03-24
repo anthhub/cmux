@@ -8,19 +8,43 @@ import (
 
 // Config is the top-level configuration for the IM bridge.
 type Config struct {
-	Cmux     CmuxConfig     `yaml:"cmux"`
-	AI       AIConfig       `yaml:"ai"`
-	Telegram TelegramConfig `yaml:"telegram"`
-	Slack    SlackConfig    `yaml:"slack"`
-	Feishu   FeishuConfig   `yaml:"feishu"`
-	Discord  DiscordConfig  `yaml:"discord"`
-	WeChat   WeChatConfig   `yaml:"wechat"`
-	Security SecurityConfig `yaml:"security"`
+	Cmux         CmuxConfig     `yaml:"cmux"`
+	Gateway      GatewayConfig  `yaml:"gateway"`
+	DefaultAgent string         `yaml:"default_agent"`
+	Agents       AgentsConfig   `yaml:"agents"`
+	AI           AIConfig       `yaml:"ai"`
+	Telegram     TelegramConfig `yaml:"telegram"`
+	Slack        SlackConfig    `yaml:"slack"`
+	Feishu       FeishuConfig   `yaml:"feishu"`
+	Discord      DiscordConfig  `yaml:"discord"`
+	WeChat       WeChatConfig   `yaml:"wechat"`
+	Security     SecurityConfig `yaml:"security"`
 }
 
 // CmuxConfig configures the cmux socket connection.
 type CmuxConfig struct {
 	SocketPath string `yaml:"socket_path"` // empty = auto-discover
+}
+
+// GatewayConfig configures the bridge state and media cache.
+type GatewayConfig struct {
+	StatePath string `yaml:"state_path"`
+	MediaDir  string `yaml:"media_dir"`
+}
+
+// AgentsConfig configures the named agent definitions exposed to IM users.
+type AgentsConfig struct {
+	List []AgentConfig `yaml:"list"`
+}
+
+// AgentConfig defines one named agent entry.
+type AgentConfig struct {
+	ID             string   `yaml:"id"`
+	Provider       string   `yaml:"provider"`
+	Model          string   `yaml:"model"`
+	CWD            string   `yaml:"cwd"`
+	Args           []string `yaml:"args"`
+	PermissionMode string   `yaml:"permission_mode"`
 }
 
 // AIConfig configures subprocess-backed AI agents.
@@ -63,9 +87,12 @@ type DiscordConfig struct {
 
 // WeChatConfig configures the WeChat bot.
 type WeChatConfig struct {
-	Enabled        bool   `yaml:"enabled"`
-	BotToken       string `yaml:"bot_token"`       // iLink bot token（从 QR 登录获取）
-	CredentialsDir string `yaml:"credentials_dir"` // 凭证保存目录，默认 ~/.weclaw/accounts
+	Enabled         bool     `yaml:"enabled"`
+	BotToken        string   `yaml:"bot_token"`       // iLink bot token（从 QR 登录获取）
+	CredentialsDir  string   `yaml:"credentials_dir"` // 凭证保存目录，默认 ~/.weclaw/accounts
+	OwnerIDs        []string `yaml:"owner_ids"`
+	EnableGroups    bool     `yaml:"enable_groups"`
+	MentionPatterns []string `yaml:"mention_patterns"`
 }
 
 // SecurityConfig configures access control.
@@ -91,7 +118,14 @@ func Load(path string) (*Config, error) {
 		cfg.Telegram.Enabled = true
 	}
 	if value := os.Getenv("CMUX_IM_BRIDGE_DEFAULT_AGENT"); value != "" {
+		cfg.DefaultAgent = value
 		cfg.AI.DefaultAgent = value
+	}
+	if value := os.Getenv("CMUX_IM_BRIDGE_STATE_PATH"); value != "" {
+		cfg.Gateway.StatePath = value
+	}
+	if value := os.Getenv("CMUX_IM_BRIDGE_MEDIA_DIR"); value != "" {
+		cfg.Gateway.MediaDir = value
 	}
 	if value := os.Getenv("CMUX_IM_BRIDGE_WORKDIR"); value != "" {
 		cfg.AI.Workdir = value
@@ -147,6 +181,20 @@ func (c *Config) EnabledChannels() []string {
 		names = append(names, "wechat")
 	}
 	return names
+}
+
+// ResolvedDefaultAgent returns the configured default agent ID with backward compatibility.
+func (c *Config) ResolvedDefaultAgent() string {
+	if c == nil {
+		return "claude"
+	}
+	if c.DefaultAgent != "" {
+		return c.DefaultAgent
+	}
+	if c.AI.DefaultAgent != "" {
+		return c.AI.DefaultAgent
+	}
+	return "claude"
 }
 
 // IsUserAllowed checks if a user ID is in the whitelist.

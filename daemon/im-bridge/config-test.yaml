@@ -1,6 +1,15 @@
 cmux:
   socket_path: "/Users/qiyuan/Library/Application Support/cmux/cmux.sock"
 
+gateway:
+  state_path: ""
+  media_dir: ""
+
+default_agent: "shell"
+
+agents:
+  list: []
+
 ai:
   default_agent: "shell" # shell mode first (no API key needed)
   workdir: ""
@@ -25,6 +34,9 @@ wechat:
   enabled: true
   bot_token: "" # empty = QR code login on startup
   credentials_dir: "" # default: ~/.weclaw/accounts
+  owner_ids: []
+  enable_groups: false
+  mention_patterns: []
 
 security:
   allowed_users: [] # allow all for testing

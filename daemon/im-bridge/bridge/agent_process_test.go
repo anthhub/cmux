@@ -21,7 +21,7 @@ func makeTestSession(agentType, model, effort, perm, providerSessionID string) *
 func TestBuildAgentCommand_ClaudeMinimal(t *testing.T) {
 	session := makeTestSession(AgentTypeClaude, "", "", "", "")
 	cmd := BuildAgentCommand(session, config.AIConfig{})
-	if cmd != "claude -p --output-format stream-json" {
+	if cmd != "claude" {
 		t.Fatalf("got %q", cmd)
 	}
 }
@@ -107,8 +107,8 @@ func TestLaunchAgentInTerminal_SendsClaudeCommand(t *testing.T) {
 	if err := LaunchAgentInTerminal(cmux, "ws-1", "surf-1", session, config.AIConfig{}); err != nil {
 		t.Fatalf("LaunchAgentInTerminal failed: %v", err)
 	}
-	if !strings.HasPrefix(sentText, "claude -p --output-format stream-json") {
-		t.Fatalf("sentText = %q, want claude stream-json command", sentText)
+	if !strings.HasPrefix(sentText, "claude\n") {
+		t.Fatalf("sentText = %q, want interactive claude command", sentText)
 	}
 }
 
@@ -165,6 +165,36 @@ func TestLaunchAgentInTerminal_Workdir(t *testing.T) {
 	}
 	if !strings.HasPrefix(sentText, "cd /my/project && claude") {
 		t.Fatalf("sentText = %q, want cd prefix", sentText)
+	}
+}
+
+func TestPrepareTurnCommand_ClaudeUsesPrintMode(t *testing.T) {
+	session := makeTestSession(AgentTypeClaude, "sonnet", "high", "auto", "sess-123")
+	command, err := PrepareTurnCommand(session, "hello", config.AIConfig{
+		ClaudePath:           "claude",
+		ClaudePermissionMode: "default",
+		Workdir:              "/tmp/project",
+	}, t.TempDir())
+	if err != nil {
+		t.Fatalf("PrepareTurnCommand failed: %v", err)
+	}
+	if !strings.Contains(command, "claude -p --output-format stream-json --include-partial-messages") {
+		t.Fatalf("command = %q, want claude print mode", command)
+	}
+	if !strings.Contains(command, "--model sonnet") {
+		t.Fatalf("command = %q, missing model", command)
+	}
+	if !strings.Contains(command, "--effort high") {
+		t.Fatalf("command = %q, missing effort", command)
+	}
+	if !strings.Contains(command, "--permission-mode auto") {
+		t.Fatalf("command = %q, missing permission mode", command)
+	}
+	if !strings.Contains(command, "--resume sess-123") {
+		t.Fatalf("command = %q, missing resume session", command)
+	}
+	if !strings.Contains(command, "cd /tmp/project && ") {
+		t.Fatalf("command = %q, missing workdir prefix", command)
 	}
 }
 

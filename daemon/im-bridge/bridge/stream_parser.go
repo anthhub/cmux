@@ -40,15 +40,30 @@ type StreamEvent struct {
 // Returns the events and nil error on success; returns nil events and non-nil error if the line
 // is not valid JSON or does not contain a recognized event.
 func ParseLine(line string) ([]StreamEvent, error) {
+	return ParseLineForProvider("", line)
+}
+
+// ParseLineForProvider parses a single output line using the current provider as a strong hint.
+func ParseLineForProvider(provider, line string) ([]StreamEvent, error) {
 	trimmed := strings.TrimSpace(line)
 	if trimmed == "" || trimmed[0] != '{' {
 		return nil, fmt.Errorf("not a json line")
 	}
-	events, err := ParseClaudeStream([]byte(trimmed))
-	if err != nil {
-		return nil, err
+
+	switch normalizeAgentType(provider) {
+	case AgentTypeClaude:
+		return ParseClaudeStream([]byte(trimmed))
+	case AgentTypeCodex:
+		return ParseCodexStream([]byte(trimmed))
 	}
-	return events, nil
+
+	if events, err := ParseClaudeStream([]byte(trimmed)); err == nil && len(events) > 0 {
+		return events, nil
+	}
+	if events, err := ParseCodexStream([]byte(trimmed)); err == nil && len(events) > 0 {
+		return events, nil
+	}
+	return nil, fmt.Errorf("unrecognized json stream event")
 }
 
 // ParseClaudeStream normalizes one Claude stream-json line.
@@ -200,8 +215,9 @@ func ParseCodexStream(line []byte) ([]StreamEvent, error) {
 	switch eventType {
 	case "thread.started":
 		events = append(events, StreamEvent{
-			Type:     StreamEventInit,
-			Provider: "codex",
+			Type:      StreamEventInit,
+			Provider:  "codex",
+			SessionID: stringValue(payload["thread_id"]),
 			Meta: map[string]interface{}{
 				"thread_id": payload["thread_id"],
 			},

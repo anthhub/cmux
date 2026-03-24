@@ -26,11 +26,15 @@ func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, s
 	log.Printf("[watcher] starting for session %s (surface %s)", session.Name, session.SurfaceID)
 
 	isAI := session.agentType() != AgentTypeShell
+	bufferedIM := isAI && strings.EqualFold(channelName, "wechat")
 
 	// For AI mode, create a per-turn presenter with a control_request callback.
 	var presenter *IMPresenter
 	if isAI {
 		presenter = NewIMPresenter(sm.channel, channelName, chatID, contextToken, session.verbose())
+		if bufferedIM {
+			presenter.SetBufferedMode("处理中...", 2*time.Second)
+		}
 		presenter.onControlRequest = func(event StreamEvent) {
 			sm.handleStreamEvent(session, event)
 		}
@@ -41,7 +45,7 @@ func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, s
 
 	idleCount := 0
 	lastSentContent := ""
-	// Pending output buffer — accumulate changes before sending (shell mode only)
+	// Pending output buffer — accumulate changes before sending (shell mode and non-buffered AI only)
 	var pendingOutput string
 	pendingTimer := time.NewTimer(0)
 	<-pendingTimer.C // drain initial fire
@@ -58,6 +62,7 @@ func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, s
 		select {
 		case <-ctx.Done():
 			log.Printf("[watcher] context cancelled for session %s", session.Name)
+			session.setRunningTurn(false)
 			if presenter != nil {
 				presenter.Close()
 			}
@@ -65,6 +70,7 @@ func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, s
 		case <-ticker.C:
 			if !session.isWatching() {
 				log.Printf("[watcher] stopped for session %s", session.Name)
+				session.setRunningTurn(false)
 				if presenter != nil {
 					presenter.Close()
 				}
@@ -100,9 +106,9 @@ func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, s
 			if isAI && presenter != nil {
 				// In AI mode: try to parse each new line as stream-json
 				for _, line := range strings.Split(diff, "\n") {
-					events, err := ParseLine(line)
+					events, err := ParseLineForProvider(session.agentType(), line)
 					if err != nil {
-						// Non-JSON line — fall through to plain-text path below
+						// Non-JSON line — keep the debounced plain-text path for all providers.
 						cleaned := strings.TrimSpace(line)
 						if cleaned != "" {
 							if pendingOutput == "" {
@@ -216,8 +222,30 @@ func cleanTerminalOutput(text string) string {
 	cleaned = stripSpinner(cleaned)
 	cleaned = stripClaudeTUI(cleaned)
 	cleaned = stripPrompt(cleaned)
+	cleaned = stripBridgeCommandEcho(cleaned)
 	cleaned = compressBlankLines(cleaned)
 	return strings.TrimSpace(cleaned)
+}
+
+func stripBridgeCommandEcho(s string) string {
+	lines := strings.Split(s, "\n")
+	result := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case strings.Contains(trimmed, "cmux-im-bridge-prompt-"):
+			continue
+		case strings.Contains(trimmed, "claude -p --output-format stream-json"):
+			continue
+		case strings.HasPrefix(trimmed, "codex exec --json"):
+			continue
+		case strings.HasPrefix(trimmed, "codex exec resume --json"):
+			continue
+		default:
+			result = append(result, line)
+		}
+	}
+	return strings.Join(result, "\n")
 }
 
 // compressBlankLines collapses 3+ consecutive blank lines into 1, and trims leading/trailing blank lines.

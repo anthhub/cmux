@@ -1,9 +1,9 @@
 cmux:
-  socket_path: "" # auto-discover
+  socket_path: "" # auto-discover the active cmux instance
 
 gateway:
-  state_path: ""
-  media_dir: ""
+  state_path: "/Users/qiyuan/.cmux/im-bridge/manual-test/state.json"
+  media_dir: "/Users/qiyuan/.cmux/im-bridge/manual-test/media"
 
 default_agent: "claude"
 
@@ -20,9 +20,9 @@ ai:
   codex_model: ""
   codex_sandbox: "workspace-write"
 
-# Only WeChat enabled for testing
 telegram:
-  enabled: false
+  enabled: true
+  bot_token: "8748900318:AAE84k4ld0rmzHELfA8xlaQteVSpveleVS0"
 
 slack:
   enabled: false
@@ -35,11 +35,11 @@ discord:
 
 wechat:
   enabled: true
-  bot_token: "" # will use QR code login
+  bot_token: "" # empty = QR code login or saved credentials
   credentials_dir: "" # default: ~/.weclaw/accounts
   owner_ids: []
   enable_groups: false
   mention_patterns: []
 
 security:
-  allowed_users: [] # allow all for testing
+  allowed_users: [] # open for manual testing
