@@ -113,6 +113,11 @@ func (tc *TelegramChannel) SendTyping(chatID string) (func(), error) {
 	stopCh := make(chan struct{})
 	var once sync.Once
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[telegram] typing goroutine panic: %v", r)
+			}
+		}()
 		ticker := time.NewTicker(4 * time.Second)
 		defer ticker.Stop()
 		for {

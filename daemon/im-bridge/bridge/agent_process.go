@@ -81,7 +81,7 @@ func (r *AgentRunner) StartTurn(ctx context.Context, session *Session, prompt st
 	r.running[session.ID] = &runningTurn{cancel: cancel, cmd: cmd}
 	r.mu.Unlock()
 
-	events := make(chan StreamEvent, 128)
+	events := make(chan StreamEvent, 1024)
 	done := make(chan error, 1)
 
 	go r.collectTurn(session, provider, cmd, stdout, stderr, events, done)

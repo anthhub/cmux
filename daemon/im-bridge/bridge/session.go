@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/manaflow-ai/cmux/daemon/im-bridge/channels"
 	"github.com/manaflow-ai/cmux/daemon/im-bridge/config"
@@ -693,7 +694,10 @@ func (sm *SessionManager) handleAIInput(agent *Agent, session *Session, msg chan
 	session.setPendingApproval("")
 	sm.appendTranscript(agent, session, "User", prompt)
 
-	turn, err := sm.runner.StartTurn(sm.ctx, session, prompt)
+	turnCtx, turnCancel := context.WithTimeout(sm.ctx, 5*time.Minute)
+	defer turnCancel()
+
+	turn, err := sm.runner.StartTurn(turnCtx, session, prompt)
 	if err != nil {
 		sm.reply(msg, "Error starting AI turn: "+err.Error())
 		return
@@ -718,6 +722,8 @@ func (sm *SessionManager) handleAIInput(agent *Agent, session *Session, msg chan
 			if assistant.Len() == 0 && strings.TrimSpace(event.Content) != "" {
 				assistant.WriteString(event.Content)
 			}
+		case StreamEventError:
+			log.Printf("[session] AI error in %s/%s: %s", agent.Name, session.Name, event.Content)
 		case StreamEventControlRequest:
 			session.setPendingApproval(event.Content)
 			perm := session.permissionMode()

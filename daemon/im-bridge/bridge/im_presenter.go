@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -130,6 +131,8 @@ func (p *IMPresenter) flushLocked(text string) {
 				if err := p.channel.EditStreaming(p.channelName, p.chatID, p.parts[idx].MessageID, msg); err == nil {
 					p.parts[idx].Text = partText
 					continue
+				} else {
+					log.Printf("[presenter] edit message %s failed: %v, sending new", p.parts[idx].MessageID, err)
 				}
 			}
 		}
