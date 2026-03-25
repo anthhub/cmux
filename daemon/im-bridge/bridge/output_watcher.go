@@ -112,7 +112,7 @@ func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, s
 					if err != nil {
 						// Non-JSON line — keep the debounced plain-text path for all providers.
 						cleaned := strings.TrimSpace(line)
-						if cleaned != "" {
+						if cleaned != "" && !looksLikeJSONFragment(cleaned) {
 							if pendingOutput == "" {
 								pendingOutput = cleaned
 							} else {
@@ -246,9 +246,25 @@ func cleanTerminalOutput(text string) string {
 	cleaned = stripSpinner(cleaned)
 	cleaned = stripClaudeTUI(cleaned)
 	cleaned = stripPrompt(cleaned)
+	cleaned = stripShellStartupNoise(cleaned)
 	cleaned = stripBridgeCommandEcho(cleaned)
 	cleaned = compressBlankLines(cleaned)
 	return strings.TrimSpace(cleaned)
+}
+
+func stripShellStartupNoise(s string) string {
+	lines := strings.Split(s, "\n")
+	result := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(trimmed, "Last login:"):
+			continue
+		default:
+			result = append(result, line)
+		}
+	}
+	return strings.Join(result, "\n")
 }
 
 func stripBridgeCommandEcho(s string) string {
@@ -270,6 +286,23 @@ func stripBridgeCommandEcho(s string) string {
 		}
 	}
 	return strings.Join(result, "\n")
+}
+
+// looksLikeJSONFragment detects partial JSON lines that leaked from stream-json output
+// (e.g. a long JSON line split across terminal screen rows).
+func looksLikeJSONFragment(s string) bool {
+	// Ends with JSON-like suffix but doesn't start with '{'
+	if s[0] == '{' {
+		return false
+	}
+	// Fragments typically contain JSON structural chars like ":"
+	if !strings.Contains(s, `":"`) {
+		return false
+	}
+	// Ends with }, or contains session_id/uuid/type patterns typical of stream-json
+	return strings.HasSuffix(s, "}") || strings.HasSuffix(s, `"}`) ||
+		strings.Contains(s, `"session_id"`) || strings.Contains(s, `"uuid"`) ||
+		strings.Contains(s, `"parent_tool_use_id"`)
 }
 
 // compressBlankLines collapses 3+ consecutive blank lines into 1, and trims leading/trailing blank lines.

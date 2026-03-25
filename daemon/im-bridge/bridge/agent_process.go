@@ -134,7 +134,7 @@ func prepareCodexTurnCommand(session *Session, prompt string, aiCfg config.AICon
 	args = append(args, "-")
 
 	command := strings.Join(args, " ")
-	command = fmt.Sprintf("%s < %s; status=$?; rm -f %s; exit $status", command, shellQuote(promptPath), shellQuote(promptPath))
+	command = fmt.Sprintf("%s < %s; rm -f %s", command, shellQuote(promptPath), shellQuote(promptPath))
 
 	workdir := coalesce(session.workdir(), aiCfg.Workdir)
 	if workdir != "" {
@@ -150,7 +150,7 @@ func prepareClaudeTurnCommand(session *Session, prompt string, aiCfg config.AICo
 	}
 
 	bin := coalesce(strings.TrimSpace(aiCfg.ClaudePath), "claude")
-	args := []string{bin, "-p", "--output-format", "stream-json", "--include-partial-messages"}
+	args := []string{bin, "-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages"}
 	if model := coalesce(session.model(), aiCfg.ClaudeModel); model != "" {
 		args = append(args, "--model", model)
 	}
@@ -165,7 +165,7 @@ func prepareClaudeTurnCommand(session *Session, prompt string, aiCfg config.AICo
 	}
 	args = append(args, session.extraArgs()...)
 	command := strings.Join(args, " ")
-	command = fmt.Sprintf("%s < %s; status=$?; rm -f %s; exit $status", command, shellQuote(promptPath), shellQuote(promptPath))
+	command = fmt.Sprintf("%s < %s; rm -f %s", command, shellQuote(promptPath), shellQuote(promptPath))
 
 	workdir := coalesce(session.workdir(), aiCfg.Workdir)
 	if workdir != "" {

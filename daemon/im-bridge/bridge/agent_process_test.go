@@ -178,7 +178,7 @@ func TestPrepareTurnCommand_ClaudeUsesPrintMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PrepareTurnCommand failed: %v", err)
 	}
-	if !strings.Contains(command, "claude -p --output-format stream-json --include-partial-messages") {
+	if !strings.Contains(command, "claude -p --output-format stream-json --verbose --include-partial-messages") {
 		t.Fatalf("command = %q, want claude print mode", command)
 	}
 	if !strings.Contains(command, "--model sonnet") {
