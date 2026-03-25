@@ -11,8 +11,8 @@ import (
 )
 
 const (
-	streamFlushInterval = 500 * time.Millisecond
-	streamFlushChars    = 200
+	streamFlushInterval = 2 * time.Second
+	streamFlushChars    = 400
 )
 
 type presentedPart struct {

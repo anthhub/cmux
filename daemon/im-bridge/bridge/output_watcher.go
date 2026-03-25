@@ -58,7 +58,9 @@ func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, s
 	pendingTimer := time.NewTimer(0)
 	<-pendingTimer.C // drain initial fire
 
-	// Track processed lines to prevent duplicates across polling cycles (used in shell mode).
+	// Track processed JSON lines to prevent duplicate events across polling cycles.
+	// extractNewLines can return the same lines when the terminal scrolls.
+	processedLines := make(map[string]bool)
 	_ = lastSentContent // used in shell mode only
 	defer func() {
 		if !pendingTimer.Stop() {
@@ -113,10 +115,15 @@ func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, s
 				// Never fall back to plain-text — terminal screen content is unreliable
 				// (wrapped lines, scrolling, duplicates) and causes repeated/garbled output.
 				for _, line := range strings.Split(diff, "\n") {
-					events, err := ParseLineForProvider(session.agentType(), line)
+					trimmed := strings.TrimSpace(line)
+					if trimmed == "" || processedLines[trimmed] {
+						continue
+					}
+					events, err := ParseLineForProvider(session.agentType(), trimmed)
 					if err != nil || len(events) == 0 {
 						continue
 					}
+					processedLines[trimmed] = true
 					for _, event := range events {
 						presenter.HandleEvent(event)
 						sm.handleStreamEvent(session, event)
