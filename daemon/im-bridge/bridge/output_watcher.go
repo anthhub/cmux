@@ -58,9 +58,8 @@ func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, s
 	pendingTimer := time.NewTimer(0)
 	<-pendingTimer.C // drain initial fire
 
-	// Track processed lines to prevent duplicates across polling cycles.
-	// extractNewLines can return the same lines when the terminal scrolls.
-	processedLines := make(map[string]bool)
+	// Track processed lines to prevent duplicates across polling cycles (used in shell mode).
+	_ = lastSentContent // used in shell mode only
 	defer func() {
 		if !pendingTimer.Stop() {
 			select {

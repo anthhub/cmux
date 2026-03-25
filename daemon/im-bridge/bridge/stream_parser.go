@@ -107,24 +107,18 @@ func ParseClaudeStream(line []byte) ([]StreamEvent, error) {
 			})
 		}
 	case "assistant":
+		// "assistant" events are accumulated snapshots emitted by --include-partial-messages.
+		// Text and thinking content is already delivered via stream_event deltas, so skip those
+		// to avoid duplicating content in the presenter. But tool_use/tool_result are only
+		// available in assistant snapshots, so we still extract those.
 		message, _ := payload["message"].(map[string]interface{})
 		contentItems, _ := message["content"].([]interface{})
 		for _, item := range contentItems {
 			block, _ := item.(map[string]interface{})
 			blockType, _ := block["type"].(string)
 			switch blockType {
-			case "text":
-				events = append(events, StreamEvent{
-					Type:     StreamEventText,
-					Provider: "claude",
-					Content:  stringValue(block["text"]),
-				})
-			case "thinking":
-				events = append(events, StreamEvent{
-					Type:     StreamEventThinking,
-					Provider: "claude",
-					Content:  stringValue(block["thinking"]),
-				})
+			case "text", "thinking":
+				// Skip — already delivered via stream_event text_delta/thinking_delta
 			case "tool_use":
 				events = append(events, StreamEvent{
 					Type:     StreamEventToolUse,
@@ -140,6 +134,13 @@ func ParseClaudeStream(line []byte) ([]StreamEvent, error) {
 					Meta:     block,
 				})
 			}
+		}
+		if sid := stringValue(payload["session_id"]); sid != "" {
+			events = append(events, StreamEvent{
+				Type:      StreamEventInit,
+				Provider:  "claude",
+				SessionID: sid,
+			})
 		}
 	case "user":
 		message, _ := payload["message"].(map[string]interface{})
