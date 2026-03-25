@@ -54,10 +54,6 @@ func (w *channelWorker) start() {
 	}()
 }
 
-func (w *channelWorker) stop() {
-	w.cancel()
-}
-
 // enqueue tries to queue work. If the queue is full it falls back to a direct send.
 func (w *channelWorker) enqueue(work outboundWork) {
 	select {
@@ -189,7 +185,7 @@ func (m *Manager) Start(ctx context.Context) error {
 			for _, startedName := range started {
 				if sch, ok := m.channels[startedName]; ok {
 					log.Printf("[channels] rolling back %s", startedName)
-					sch.Stop()
+					_ = sch.Stop()
 				}
 			}
 			return fmt.Errorf("failed to start channel %s: %w", name, err)

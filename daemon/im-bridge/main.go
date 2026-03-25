@@ -135,7 +135,8 @@ func main() {
 	<-sigCh
 
 	log.Println("[main] shutting down...")
-	mgr.Stop()
+	cancel()    // cancel context first so goroutines exit
+	mgr.Stop()  // then stop channel manager
 	log.Println("[main] stopped")
 }
 

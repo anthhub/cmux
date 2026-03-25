@@ -50,7 +50,7 @@ func startMockSocket(t *testing.T) (string, func()) {
 					_ = buf[:n]
 					// Always respond with a successful ping
 					resp := `{"jsonrpc":"2.0","id":1,"result":{"ok":true}}` + "\n"
-					c.Write([]byte(resp))
+					_, _ = c.Write([]byte(resp))
 				}
 			}(conn)
 		}

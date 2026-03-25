@@ -269,9 +269,7 @@ func (p *IMPresenter) stopPlaceholderTimerLocked() {
 	if p.placeholderTimer == nil {
 		return
 	}
-	if !p.placeholderTimer.Stop() {
-		// Timer may already be firing; callback will observe finished state.
-	}
+	p.placeholderTimer.Stop()
 	p.placeholderTimer = nil
 }
 

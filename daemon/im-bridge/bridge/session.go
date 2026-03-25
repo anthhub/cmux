@@ -749,6 +749,7 @@ func (sm *SessionManager) syncAgentSessions(agent *Agent) error {
 			agent.Sessions[surface.ID] = session
 		}
 
+		session.mu.Lock()
 		session.Name = sessionNameForSurface(surface, index)
 		session.SurfaceType = surface.Type
 		session.AgentID = normalizeKey(agent.Name)
@@ -757,6 +758,7 @@ func (sm *SessionManager) syncAgentSessions(agent *Agent) error {
 			session.AgentType = defaultType
 		}
 		session.RouteKey = sessionRouteKey(agent.Name, session.Name)
+		session.mu.Unlock()
 		sm.applyAgentDefaults(agent, session)
 		order = append(order, session.ID)
 
@@ -1497,6 +1499,17 @@ func (sm *SessionManager) handleRead(agent *Agent, msg channels.InboundMessage, 
 	sm.reply(msg, cleanTerminalOutput(text))
 }
 
+var rawAllowedMethods = map[string]bool{
+	"system.ping":        true,
+	"system.tree":        true,
+	"workspace.list":     true,
+	"window.list":        true,
+	"surface.list":       true,
+	"surface.read_text":  true,
+	"pane.list":          true,
+	"browser.screenshot": true,
+}
+
 func (sm *SessionManager) handleRaw(agent *Agent, msg channels.InboundMessage, raw string) {
 	fields := strings.Fields(raw)
 	if len(fields) == 0 {
@@ -1504,6 +1517,10 @@ func (sm *SessionManager) handleRaw(agent *Agent, msg channels.InboundMessage, r
 		return
 	}
 	method := fields[0]
+	if !rawAllowedMethods[method] {
+		sm.reply(msg, fmt.Sprintf("Method %q is not allowed via /raw", method))
+		return
+	}
 	paramText := strings.TrimSpace(strings.TrimPrefix(raw, method))
 
 	var params interface{} = map[string]interface{}{}
@@ -1793,10 +1810,6 @@ func (sm *SessionManager) reply(msg channels.InboundMessage, text string) {
 	sm.sendTextWithContext(msg.ChannelName, msg.ChatID, msg.ContextToken, text)
 }
 
-func (sm *SessionManager) sendText(channelName, chatID, text string) {
-	sm.sendTextWithContext(channelName, chatID, "", text)
-}
-
 func (sm *SessionManager) sendTextWithContext(channelName, chatID, contextToken, text string) {
 	chunks := splitMessage(text, sm.channel.MaxMessageLength(channelName))
 	if len(chunks) == 0 {
@@ -2005,12 +2018,6 @@ func (s *Session) isWatching() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.watchCancel != nil
-}
-
-func (s *Session) lastOutput() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.LastOutput
 }
 
 func (s *Session) setLastOutput(text string) {

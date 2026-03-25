@@ -221,36 +221,44 @@ func (tc *TelegramChannel) OnMessage(handler func(msg InboundMessage)) {
 // escapeMarkdownV2 escapes special characters for Telegram MarkdownV2 parse mode,
 // preserving content inside code blocks (``` and `) unchanged.
 func escapeMarkdownV2(text string) string {
-	const specialChars = `_*[]()~` + "`" + `>#+-=|{}.!`
+	const specialChars = `_*[]()~>#+-=|{}.!`
 
 	var b strings.Builder
-	b.Grow(len(text))
+	b.Grow(len(text) + len(text)/4)
 
+	runes := []rune(text)
 	i := 0
-	for i < len(text) {
+	for i < len(runes) {
 		// Check for fenced code block ```
-		if i+2 < len(text) && text[i:i+3] == "```" {
-			end := strings.Index(text[i+3:], "```")
+		if i+2 < len(runes) && runes[i] == '`' && runes[i+1] == '`' && runes[i+2] == '`' {
+			rest := string(runes[i+3:])
+			end := strings.Index(rest, "```")
 			if end >= 0 {
-				b.WriteString(text[i : i+3+end+3])
-				i += 3 + end + 3
+				// Write the entire fenced block (including delimiters) unchanged
+				fenced := string(runes[i : i+3]) + rest[:end+3]
+				b.WriteString(fenced)
+				i += 3 + len([]rune(rest[:end])) + 3
 				continue
 			}
 		}
 		// Check for inline code `
-		if text[i] == '`' {
-			end := strings.IndexByte(text[i+1:], '`')
+		if runes[i] == '`' {
+			rest := string(runes[i+1:])
+			end := strings.IndexByte(rest, '`')
 			if end >= 0 {
-				b.WriteString(text[i : i+1+end+1])
-				i += 1 + end + 1
+				// Write the entire inline code span unchanged
+				inline := string(runes[i:i+1]) + rest[:end+1]
+				b.WriteString(inline)
+				i += 1 + len([]rune(rest[:end])) + 1
 				continue
 			}
 		}
-		// Escape special characters outside code
-		if strings.ContainsRune(specialChars, rune(text[i])) {
+		// Escape special characters outside code (backtick is NOT escaped)
+		r := runes[i]
+		if strings.ContainsRune(specialChars, r) {
 			b.WriteByte('\\')
 		}
-		b.WriteByte(text[i])
+		b.WriteRune(r)
 		i++
 	}
 	return b.String()

@@ -76,6 +76,6 @@ func handleMockConnection(conn net.Conn, handler func(string, json.RawMessage) (
 			})
 		}
 		resp = append(resp, '\n')
-		conn.Write(resp)
+		_, _ = conn.Write(resp)
 	}
 }

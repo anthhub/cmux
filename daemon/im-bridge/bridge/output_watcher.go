@@ -11,9 +11,10 @@ import (
 )
 
 const (
-	fastInterval = 200 * time.Millisecond
-	slowInterval = 2 * time.Second
-	idleInterval = 5 * time.Second
+	fastInterval   = 200 * time.Millisecond
+	slowInterval   = 2 * time.Second
+	idleInterval   = 5 * time.Second
+	maxPendingSize = 64 * 1024 // 64KB cap to prevent unbounded growth
 )
 
 // watchOutput polls a terminal surface for output changes and streams diffs to IM.
@@ -23,8 +24,12 @@ const (
 // - Strips ANSI codes, cleans up terminal noise
 // - In AI mode, attempts to parse stream-json lines and route them through IMPresenter
 func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, session *Session, channelName, chatID, contextToken string) {
+	var presenter *IMPresenter
 	defer func() {
 		session.setRunningTurn(false)
+		if presenter != nil {
+			presenter.Close()
+		}
 	}()
 
 	log.Printf("[watcher] starting for session %s (surface %s)", session.Name, session.SurfaceID)
@@ -33,7 +38,6 @@ func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, s
 	bufferedIM := isAI && strings.EqualFold(channelName, "wechat")
 
 	// For AI mode, create a per-turn presenter with a control_request callback.
-	var presenter *IMPresenter
 	if isAI {
 		presenter = NewIMPresenter(sm.channel, channelName, chatID, contextToken, session.verbose())
 		if bufferedIM {
@@ -66,18 +70,10 @@ func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, s
 		select {
 		case <-ctx.Done():
 			log.Printf("[watcher] context cancelled for session %s", session.Name)
-			session.setRunningTurn(false)
-			if presenter != nil {
-				presenter.Close()
-			}
 			return
 		case <-ticker.C:
 			if !session.isWatching() {
 				log.Printf("[watcher] stopped for session %s", session.Name)
-				session.setRunningTurn(false)
-				if presenter != nil {
-					presenter.Close()
-				}
 				return
 			}
 
@@ -122,7 +118,18 @@ func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, s
 							} else {
 								pendingOutput += "\n" + cleaned
 							}
-							resetTimer(pendingTimer, 1*time.Second)
+							if len(pendingOutput) > maxPendingSize {
+								// Force flush to prevent unbounded growth
+								if pendingOutput != lastSentContent {
+									log.Printf("[watcher] force flush %d chars (cap) for session %s", len(pendingOutput), session.Name)
+									lastSentContent = pendingOutput
+									sm.sendTextWithContext(channelName, chatID, contextToken, pendingOutput)
+								}
+								pendingOutput = ""
+								pendingTimer.Stop()
+							} else {
+								resetTimer(pendingTimer, 1*time.Second)
+							}
 						}
 						continue
 					}
@@ -142,7 +149,18 @@ func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, s
 				} else {
 					pendingOutput += "\n" + cleaned
 				}
-				resetTimer(pendingTimer, 1*time.Second)
+				if len(pendingOutput) > maxPendingSize {
+					// Force flush to prevent unbounded growth
+					if pendingOutput != lastSentContent {
+						log.Printf("[watcher] force flush %d chars (cap) for session %s", len(pendingOutput), session.Name)
+						lastSentContent = pendingOutput
+						sm.sendTextWithContext(channelName, chatID, contextToken, pendingOutput)
+					}
+					pendingOutput = ""
+					pendingTimer.Stop()
+				} else {
+					resetTimer(pendingTimer, 1*time.Second)
+				}
 			}
 
 		case <-pendingTimer.C:

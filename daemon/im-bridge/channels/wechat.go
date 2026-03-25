@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -399,7 +400,28 @@ func (w *WeChatChannel) qrLogin(ctx context.Context) error {
 			return fmt.Errorf("get qr code: %w", err)
 		}
 
-		log.Printf("[wechat] scan QR code to login: %s", qrResp.ImageContent)
+		// Save QR code image to a temp file for easy scanning.
+		if qrResp.ImageContent != "" {
+			imgData := qrResp.ImageContent
+			// Strip data URI prefix if present (e.g. "data:image/png;base64,")
+			if idx := strings.Index(imgData, ","); idx >= 0 && strings.Contains(imgData[:idx], "base64") {
+				imgData = imgData[idx+1:]
+			}
+			if decoded, err := base64.StdEncoding.DecodeString(imgData); err == nil {
+				qrPath := fmt.Sprintf("/tmp/wechat-qr-%d.png", time.Now().Unix())
+				if err := os.WriteFile(qrPath, decoded, 0644); err == nil {
+					log.Printf("[wechat] QR code saved to: %s — open it and scan to login", qrPath)
+				} else {
+					log.Printf("[wechat] failed to write QR file: %v", err)
+					log.Printf("[wechat] scan QR code to login (base64): %s", qrResp.ImageContent)
+				}
+			} else {
+				log.Printf("[wechat] failed to decode QR base64: %v", err)
+				log.Printf("[wechat] scan QR code to login (base64): %s", qrResp.ImageContent)
+			}
+		} else {
+			log.Println("[wechat] QR code response has no image content")
+		}
 
 		// Poll for QR code status.
 		pollURL := fmt.Sprintf("/ilink/bot/get_qrcode_status?qrcode=%s", qrResp.QRCodeID)
