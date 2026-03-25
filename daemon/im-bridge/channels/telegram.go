@@ -140,10 +140,14 @@ func (tc *TelegramChannel) SendTyping(chatID string) (func(), error) {
 		}()
 		ticker := time.NewTicker(4 * time.Second)
 		defer ticker.Stop()
+		timeout := time.NewTimer(60 * time.Second)
+		defer timeout.Stop()
 		for {
 			select {
 			case <-stopCh:
 				return
+			case <-timeout.C:
+				return // Auto-stop after max lifetime
 			case <-ticker.C:
 				if err := tc.bot.Notify(chat, tele.Typing); err != nil {
 					log.Printf("[telegram] typing notify failed: %v", err)

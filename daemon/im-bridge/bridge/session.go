@@ -78,6 +78,7 @@ type Session struct {
 
 	watchCancel context.CancelFunc
 	runningTurn bool
+	streamMu    sync.Mutex
 	mu          sync.RWMutex
 }
 
@@ -94,6 +95,7 @@ type SessionManager struct {
 	defaultAgentID   string
 	defaultAgentType string
 	presenter        *IMPresenter
+	persistMu        sync.Mutex
 	mu               sync.RWMutex
 }
 
@@ -578,6 +580,8 @@ func (sm *SessionManager) persistSessionState(agent *Agent, session *Session) {
 	if routeKey == "" {
 		routeKey = sessionRouteKey(agent.Name, session.Name)
 	}
+	sm.persistMu.Lock()
+	defer sm.persistMu.Unlock()
 	err := sm.state.SaveSession(PersistedSessionState{
 		SessionKey:        routeKey,
 		AgentID:           normalizeKey(agent.Name),
@@ -601,6 +605,8 @@ func (sm *SessionManager) persistSessionSnapshot(session *Session) {
 	if sm.state == nil || session == nil || session.RouteKey == "" {
 		return
 	}
+	sm.persistMu.Lock()
+	defer sm.persistMu.Unlock()
 	err := sm.state.SaveSession(PersistedSessionState{
 		SessionKey:        session.RouteKey,
 		AgentID:           normalizeKey(session.AgentID),
@@ -721,24 +727,26 @@ func (sm *SessionManager) syncAgentSessions(agent *Agent) error {
 	agent.mu.Lock()
 	defer agent.mu.Unlock()
 
-	existing := agent.Sessions
-	if existing == nil {
-		existing = make(map[string]*Session)
+	if agent.Sessions == nil {
+		agent.Sessions = make(map[string]*Session)
 	}
 	defaultType := effectiveAgentType(agent.DefaultType, AgentTypeClaude)
 
-	sessions := make(map[string]*Session, len(surfaces))
+	// Track which surface IDs are still present
+	seen := make(map[string]bool, len(surfaces))
 	order := make([]string, 0, len(surfaces))
 	activeSID := agent.ActiveSID
 
 	for index, surface := range surfaces {
-		session, ok := existing[surface.ID]
+		seen[surface.ID] = true
+		session, ok := agent.Sessions[surface.ID]
 		if !ok {
 			session = &Session{
 				ID:        surface.ID,
 				SurfaceID: surface.ID,
 				AgentType: defaultType,
 			}
+			agent.Sessions[surface.ID] = session
 		}
 
 		session.Name = sessionNameForSurface(surface, index)
@@ -750,7 +758,6 @@ func (sm *SessionManager) syncAgentSessions(agent *Agent) error {
 		}
 		session.RouteKey = sessionRouteKey(agent.Name, session.Name)
 		sm.applyAgentDefaults(agent, session)
-		sessions[session.ID] = session
 		order = append(order, session.ID)
 
 		if surface.Focused {
@@ -758,19 +765,20 @@ func (sm *SessionManager) syncAgentSessions(agent *Agent) error {
 		}
 	}
 
-	for id, session := range existing {
-		if _, ok := sessions[id]; !ok {
+	// Remove stale sessions that no longer have a surface
+	for id, session := range agent.Sessions {
+		if !seen[id] {
 			session.stopWatching()
+			delete(agent.Sessions, id)
 		}
 	}
 
-	if activeSID == "" || sessions[activeSID] == nil {
+	if activeSID == "" || agent.Sessions[activeSID] == nil {
 		if len(order) > 0 {
 			activeSID = order[0]
 		}
 	}
 
-	agent.Sessions = sessions
 	agent.SessionOrder = order
 	agent.ActiveSID = activeSID
 	return nil
@@ -1349,7 +1357,7 @@ func (sm *SessionManager) handleScreenshot(agent *Agent, msg channels.InboundMes
 
 	text, readErr := sm.cmux.ReadText(agent.workspaceID(), session.SurfaceID)
 	if readErr != nil {
-		sm.reply(msg, "Screenshot unavailable on this build: "+err.Error())
+		sm.reply(msg, "Screenshot unavailable on this build: "+readErr.Error())
 		return
 	}
 
@@ -1725,6 +1733,9 @@ In shell sessions, plain text runs in the terminal.`
 // handleStreamEvent processes a parsed stream event and updates session state accordingly.
 // It is called by the presenter callback and by output_watcher for AI-mode sessions.
 func (sm *SessionManager) handleStreamEvent(session *Session, event StreamEvent) {
+	session.streamMu.Lock()
+	defer session.streamMu.Unlock()
+
 	switch event.Type {
 	case StreamEventInit:
 		if event.SessionID != "" {
@@ -1972,11 +1983,12 @@ func (a *Agent) ListSessions() []*Session {
 
 func (s *Session) setWatchCancel(cancel context.CancelFunc) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.watchCancel != nil {
-		s.watchCancel()
-	}
+	oldCancel := s.watchCancel
 	s.watchCancel = cancel
+	s.mu.Unlock()
+	if oldCancel != nil {
+		oldCancel()
+	}
 }
 
 func (s *Session) stopWatching() {
@@ -2005,6 +2017,16 @@ func (s *Session) setLastOutput(text string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.LastOutput = text
+}
+
+// swapLastOutput atomically reads the old LastOutput and replaces it with newOutput,
+// avoiding the TOCTOU race between separate lastOutput()/setLastOutput() calls.
+func (s *Session) swapLastOutput(newOutput string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	old := s.LastOutput
+	s.LastOutput = newOutput
+	return old
 }
 
 func (s *Session) isRunningTurn() bool {

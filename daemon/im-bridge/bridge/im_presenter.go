@@ -107,22 +107,22 @@ func (p *IMPresenter) HandleEvent(event StreamEvent) {
 		p.maybeFlushLocked(false)
 	case StreamEventThinking:
 		if p.verbose && strings.TrimSpace(event.Content) != "" {
-			p.sendStandalone("Thinking:\n" + strings.TrimSpace(event.Content))
+			p.sendStandaloneLocked("Thinking:\n" + strings.TrimSpace(event.Content))
 		}
 	case StreamEventToolUse:
 		if p.verbose && strings.TrimSpace(event.Content) != "" {
-			p.sendStandalone("Tool:\n" + strings.TrimSpace(event.Content))
+			p.sendStandaloneLocked("Tool:\n" + strings.TrimSpace(event.Content))
 		}
 	case StreamEventToolResult:
 		if p.verbose && strings.TrimSpace(event.Content) != "" {
-			p.sendStandalone("Tool Result:\n" + strings.TrimSpace(event.Content))
+			p.sendStandaloneLocked("Tool Result:\n" + strings.TrimSpace(event.Content))
 		}
 	case StreamEventControlRequest:
 		message := strings.TrimSpace(event.Content)
 		if message == "" {
 			message = "Approval required. Use /approve or /deny."
 		}
-		p.sendStandalone(message)
+		p.sendStandaloneLocked(message)
 		// Invoke callback outside the lock to avoid deadlock
 		cb := p.onControlRequest
 		if cb != nil {
@@ -132,7 +132,7 @@ func (p *IMPresenter) HandleEvent(event StreamEvent) {
 		}
 	case StreamEventError:
 		if strings.TrimSpace(event.Content) != "" {
-			p.sendStandalone("Error: " + strings.TrimSpace(event.Content))
+			p.sendStandaloneLocked("Error: " + strings.TrimSpace(event.Content))
 		}
 	case StreamEventResult:
 		p.finished = true
@@ -182,11 +182,13 @@ func (p *IMPresenter) flushBufferedLocked(text string) {
 	}
 	parts := splitForIM(text, p.channel.MaxMessageLength(p.channelName))
 	for _, partText := range parts {
-		_ = p.channel.Send(p.channelName, p.chatID, channels.OutboundMessage{
+		if err := p.channel.Send(p.channelName, p.chatID, channels.OutboundMessage{
 			Text:         partText,
 			Format:       "text",
 			ContextToken: p.contextToken,
-		})
+		}); err != nil {
+			log.Printf("[presenter] send failed: %v", err)
+		}
 	}
 	p.buffer.Reset()
 	p.parts = nil
@@ -216,6 +218,7 @@ func (p *IMPresenter) flushLocked(text string) {
 
 		messageID, err := p.channel.SendStreaming(p.channelName, p.chatID, msg)
 		if err != nil {
+			log.Printf("[presenter] send streaming failed: %v", err)
 			continue
 		}
 		if idx < len(p.parts) {
@@ -279,7 +282,9 @@ func (p *IMPresenter) stopTypingLocked() {
 	}
 }
 
-func (p *IMPresenter) sendStandalone(text string) {
+// sendStandaloneLocked sends a standalone message to the channel.
+// MUST be called with p.mu held.
+func (p *IMPresenter) sendStandaloneLocked(text string) {
 	if strings.TrimSpace(text) == "" {
 		return
 	}
@@ -339,13 +344,14 @@ func splitForIM(text string, maxLen int) []string {
 			}
 		}
 		current.WriteString(lineWithBreak)
-		if strings.HasPrefix(line, "```") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "```") && (len(trimmed) == 3 || trimmed[3] != '`') {
 			if inCodeFence {
 				inCodeFence = false
 				codeFenceHeader = "```"
 			} else {
 				inCodeFence = true
-				if strings.TrimSpace(line) != "" {
+				if trimmed != "" {
 					codeFenceHeader = line
 				}
 			}

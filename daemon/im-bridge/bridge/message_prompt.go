@@ -1,15 +1,22 @@
 package bridge
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/manaflow-ai/cmux/daemon/im-bridge/channels"
+)
+
+const (
+	downloadTimeout     = 30 * time.Second
+	downloadMaxBodySize = 50 * 1024 * 1024 // 50 MB
 )
 
 type preparedAttachment struct {
@@ -109,7 +116,20 @@ func writeAttachmentData(mediaDir string, attachment channels.Attachment, idx in
 }
 
 func downloadAttachment(mediaDir string, attachment channels.Attachment, idx int) (string, error) {
-	resp, err := http.Get(attachment.URL)
+	u, err := url.Parse(attachment.URL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return "", fmt.Errorf("invalid attachment URL scheme: %q", attachment.URL)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), downloadTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, attachment.URL, nil)
+	if err != nil {
+		return "", fmt.Errorf("create download request %q: %w", attachment.URL, err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("download attachment %q: %w", attachment.URL, err)
 	}
@@ -126,7 +146,8 @@ func downloadAttachment(mediaDir string, attachment channels.Attachment, idx int
 	}
 	defer file.Close()
 
-	if _, err := io.Copy(file, resp.Body); err != nil {
+	limited := io.LimitReader(resp.Body, downloadMaxBodySize)
+	if _, err := io.Copy(file, limited); err != nil {
 		return "", fmt.Errorf("copy attachment %q: %w", attachment.URL, err)
 	}
 	return path, nil
@@ -136,7 +157,12 @@ func attachmentFilename(attachment channels.Attachment, idx int) string {
 	if name := strings.TrimSpace(attachment.Filename); name != "" {
 		return sanitizeName(filepath.Base(name))
 	}
-	ext := filepath.Ext(strings.TrimSpace(attachment.URL))
+	rawURL := strings.TrimSpace(attachment.URL)
+	urlPath := rawURL
+	if u, err := url.Parse(rawURL); err == nil && u.Path != "" {
+		urlPath = u.Path
+	}
+	ext := filepath.Ext(urlPath)
 	if ext == "" {
 		switch attachment.Type {
 		case "image":

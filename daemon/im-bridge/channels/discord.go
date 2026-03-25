@@ -11,21 +11,17 @@ import (
 	"sync"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/manaflow-ai/cmux/daemon/im-bridge/config"
 )
 
 func init() {
 	RegisterFactory("discord", func(cfg interface{}) (Channel, error) {
-		dc, ok := cfg.(*discordFactoryCfg)
+		dc, ok := cfg.(*config.DiscordConfig)
 		if !ok {
-			return nil, fmt.Errorf("discord factory: expected *discordFactoryCfg, got %T", cfg)
+			return nil, fmt.Errorf("discord factory: expected *config.DiscordConfig, got %T", cfg)
 		}
 		return NewDiscordChannel(dc.BotToken)
 	})
-}
-
-// discordFactoryCfg is the config type passed to the discord factory.
-type discordFactoryCfg struct {
-	BotToken string
 }
 
 // DiscordChannel implements Channel for Discord.

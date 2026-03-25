@@ -52,6 +52,7 @@ type WeChatChannel struct {
 	credsDir   string
 	ctx        context.Context
 	cancel     context.CancelFunc
+	relogging  bool
 	mu         sync.Mutex
 }
 
@@ -118,7 +119,12 @@ func (w *WeChatChannel) Send(chatID string, msg OutboundMessage) error {
 
 	w.mu.Lock()
 	botID := w.botID
+	relogging := w.relogging
 	w.mu.Unlock()
+
+	if relogging {
+		return fmt.Errorf("wechat: re-login in progress, try again later")
+	}
 
 	text, imageURLs, fallbackText := normalizeWeChatOutbound(msg.Text, msg.Attachments)
 	items := make([]wechatMsgItem, 0, 1+len(imageURLs)+1)
@@ -230,16 +236,18 @@ func (w *WeChatChannel) pollLoop(ctx context.Context) {
 
 		// Handle session expired error — need to re-login.
 		if resp.Errcode == -14 {
-			log.Println("[wechat] session expired (errcode -14), clearing token and re-logging in...")
+			log.Println("[wechat] session expired (errcode -14), starting re-login...")
 			w.mu.Lock()
+			w.relogging = true
 			w.syncBuf = ""
 			w.botToken = ""
-			w.botID = ""
+			// Keep botID intact so in-flight Send() calls don't use an empty ToUserID.
 			w.mu.Unlock()
 			w.saveCredentials()
 
 			if err := w.qrLogin(ctx); err != nil {
 				log.Printf("[wechat] re-login failed: %v, retrying in %v", err, backoff)
+				// relogging stays true; Send() will keep rejecting.
 				select {
 				case <-ctx.Done():
 					return
@@ -248,6 +256,9 @@ func (w *WeChatChannel) pollLoop(ctx context.Context) {
 				backoff = min(backoff*2, maxBackoff)
 				continue
 			}
+			w.mu.Lock()
+			w.relogging = false
+			w.mu.Unlock()
 			log.Println("[wechat] re-login successful, resuming poll")
 			backoff = 3 * time.Second
 			continue
@@ -273,10 +284,6 @@ func (w *WeChatChannel) pollLoop(ctx context.Context) {
 			w.saveCredentials()
 		}
 
-		w.mu.Lock()
-		handler := w.handler
-		w.mu.Unlock()
-
 		for _, msg := range resp.Messages {
 			// Only process user messages (message_type=1) that are finished (message_state=0 or 2).
 			if msg.MsgType.String() != "1" {
@@ -301,27 +308,34 @@ func (w *WeChatChannel) pollLoop(ctx context.Context) {
 				continue
 			}
 
-			if handler != nil {
-				accountID := msg.ToUserID
-				if accountID == "" {
-					w.mu.Lock()
-					accountID = w.botID
-					w.mu.Unlock()
-				}
-				peerID := msg.FromUserID
-				handler(InboundMessage{
-					ChannelName:  "wechat",
-					AccountID:    accountID,
-					ChatID:       peerID,
-					PeerKind:     "dm",
-					PeerID:       peerID,
-					MessageID:    fmt.Sprintf("%d", msg.MessageID),
-					UserID:       peerID,
-					Text:         text,
-					ContextToken: msg.ContextToken,
-					Attachments:  attachments,
-				})
+			// Read handler inside the loop to avoid losing messages if
+			// OnMessage is called between poll start and message processing.
+			w.mu.Lock()
+			handler := w.handler
+			w.mu.Unlock()
+			if handler == nil {
+				continue
 			}
+
+			accountID := msg.ToUserID
+			if accountID == "" {
+				w.mu.Lock()
+				accountID = w.botID
+				w.mu.Unlock()
+			}
+			peerID := msg.FromUserID
+			handler(InboundMessage{
+				ChannelName:  "wechat",
+				AccountID:    accountID,
+				ChatID:       peerID,
+				PeerKind:     "dm",
+				PeerID:       peerID,
+				MessageID:    fmt.Sprintf("%d", msg.MessageID),
+				UserID:       peerID,
+				Text:         text,
+				ContextToken: msg.ContextToken,
+				Attachments:  attachments,
+			})
 		}
 	}
 }

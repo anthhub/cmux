@@ -10,24 +10,19 @@ import (
 	"log"
 	"sync"
 
+	"github.com/manaflow-ai/cmux/daemon/im-bridge/config"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/socketmode"
 )
 
 func init() {
 	RegisterFactory("slack", func(cfg interface{}) (Channel, error) {
-		sc, ok := cfg.(*slackFactoryCfg)
+		sc, ok := cfg.(*config.SlackConfig)
 		if !ok {
-			return nil, fmt.Errorf("slack factory: expected *slackFactoryCfg, got %T", cfg)
+			return nil, fmt.Errorf("slack factory: expected *config.SlackConfig, got %T", cfg)
 		}
 		return NewSlackChannel(sc.BotToken, sc.AppToken)
 	})
-}
-
-// slackFactoryCfg is the config type passed to the slack factory.
-type slackFactoryCfg struct {
-	BotToken string
-	AppToken string
 }
 
 // SlackChannel implements Channel for Slack using Socket Mode.

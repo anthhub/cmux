@@ -23,6 +23,7 @@ type channelWorker struct {
 	queue  chan outboundWork
 	ctx    context.Context
 	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
 func newChannelWorker(ctx context.Context, ch Channel) *channelWorker {
@@ -36,7 +37,9 @@ func newChannelWorker(ctx context.Context, ch Channel) *channelWorker {
 }
 
 func (w *channelWorker) start() {
+	w.wg.Add(1)
 	go func() {
+		defer w.wg.Done()
 		for {
 			select {
 			case <-w.ctx.Done():
@@ -202,13 +205,21 @@ func (m *Manager) Stop() {
 	m.cancel() // signal all workers to stop
 
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-
+	workers := make([]*channelWorker, 0, len(m.workers))
+	for _, w := range m.workers {
+		workers = append(workers, w)
+	}
 	for name, ch := range m.channels {
 		log.Printf("[channels] stopping %s", name)
 		if err := ch.Stop(); err != nil {
 			log.Printf("[channels] error stopping %s: %v", name, err)
 		}
+	}
+	m.mu.RUnlock()
+
+	// Wait for all worker goroutines to finish.
+	for _, w := range workers {
+		w.wg.Wait()
 	}
 }
 

@@ -91,6 +91,7 @@ func (s *GatewayStateStore) flushLocked() error {
 		return fmt.Errorf("write temp state store: %w", err)
 	}
 	if err := os.Rename(tmpPath, s.path); err != nil {
+		os.Remove(tmpPath) // best-effort cleanup
 		return fmt.Errorf("replace state store: %w", err)
 	}
 	return nil

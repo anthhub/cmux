@@ -23,6 +23,10 @@ const (
 // - Strips ANSI codes, cleans up terminal noise
 // - In AI mode, attempts to parse stream-json lines and route them through IMPresenter
 func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, session *Session, channelName, chatID, contextToken string) {
+	defer func() {
+		session.setRunningTurn(false)
+	}()
+
 	log.Printf("[watcher] starting for session %s (surface %s)", session.Name, session.SurfaceID)
 
 	isAI := session.agentType() != AgentTypeShell
@@ -85,7 +89,10 @@ func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, s
 
 			// Normalize for comparison — strip ANSI first to avoid false diffs from cursor/color changes
 			currentCleaned := cleanTerminalOutput(currentOutput)
-			lastCleaned := cleanTerminalOutput(session.lastOutput())
+
+			// Atomically swap lastOutput to avoid TOCTOU race between read and write
+			previousOutput := session.swapLastOutput(currentOutput)
+			lastCleaned := cleanTerminalOutput(previousOutput)
 
 			if currentCleaned == lastCleaned || currentCleaned == "" {
 				idleCount++
@@ -99,7 +106,6 @@ func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, s
 
 			// Genuine new content detected
 			diff := extractNewLines(lastCleaned, currentCleaned)
-			session.setLastOutput(currentOutput)
 			idleCount = 0
 			ticker.Reset(fastInterval)
 

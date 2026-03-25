@@ -16,22 +16,17 @@ import (
 	larkevent "github.com/larksuite/oapi-sdk-go/v3/event"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
+	"github.com/manaflow-ai/cmux/daemon/im-bridge/config"
 )
 
 func init() {
 	RegisterFactory("feishu", func(cfg interface{}) (Channel, error) {
-		fc, ok := cfg.(*feishuFactoryCfg)
+		fc, ok := cfg.(*config.FeishuConfig)
 		if !ok {
-			return nil, fmt.Errorf("feishu factory: expected *feishuFactoryCfg, got %T", cfg)
+			return nil, fmt.Errorf("feishu factory: expected *config.FeishuConfig, got %T", cfg)
 		}
 		return NewFeishuChannel(fc.AppID, fc.AppSecret)
 	})
-}
-
-// feishuFactoryCfg is the config type passed to the feishu factory.
-type feishuFactoryCfg struct {
-	AppID     string
-	AppSecret string
 }
 
 // FeishuChannel implements Channel for Feishu/Lark.

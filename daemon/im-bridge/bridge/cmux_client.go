@@ -23,6 +23,7 @@ type CmuxClient struct {
 	mu                   sync.Mutex
 	lastReconnectAttempt time.Time
 	reconnectBackoff     time.Duration
+	reconnecting         bool // true while a dial is in progress
 }
 
 // jsonRPCRequest is the JSON-RPC 2.0 request format.
@@ -227,13 +228,24 @@ func (c *CmuxClient) connectLocked() error {
 		return nil
 	}
 
+	// Enforce backoff: if we are still within the backoff window, fail fast
+	// instead of sleeping while holding the mutex (which would block all callers).
 	if !c.lastReconnectAttempt.IsZero() && c.reconnectBackoff > 0 {
 		if wait := time.Until(c.lastReconnectAttempt.Add(c.reconnectBackoff)); wait > 0 {
-			time.Sleep(wait)
+			return fmt.Errorf("cmux socket reconnect backoff (%v remaining)", wait)
 		}
 	}
 
+	// Prevent thundering herd: if another goroutine is already dialing
+	// (shouldn't happen with the mutex, but guard against re-entrant paths),
+	// fail fast.
+	if c.reconnecting {
+		return fmt.Errorf("cmux socket reconnection already in progress")
+	}
+	c.reconnecting = true
+
 	conn, err := net.Dial("unix", c.socketPath)
+	c.reconnecting = false
 	c.lastReconnectAttempt = time.Now()
 	if err != nil {
 		if c.reconnectBackoff == 0 {
