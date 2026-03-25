@@ -57,6 +57,10 @@ func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, s
 	var pendingOutput string
 	pendingTimer := time.NewTimer(0)
 	<-pendingTimer.C // drain initial fire
+
+	// Track processed lines to prevent duplicates across polling cycles.
+	// extractNewLines can return the same lines when the terminal scrolls.
+	processedLines := make(map[string]bool)
 	defer func() {
 		if !pendingTimer.Stop() {
 			select {
@@ -106,31 +110,12 @@ func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, s
 			ticker.Reset(fastInterval)
 
 			if isAI && presenter != nil {
-				// In AI mode: try to parse each new line as stream-json
+				// AI mode: only use stream-json events via presenter.
+				// Never fall back to plain-text — terminal screen content is unreliable
+				// (wrapped lines, scrolling, duplicates) and causes repeated/garbled output.
 				for _, line := range strings.Split(diff, "\n") {
 					events, err := ParseLineForProvider(session.agentType(), line)
-					if err != nil {
-						// Non-JSON line — keep the debounced plain-text path for all providers.
-						cleaned := strings.TrimSpace(line)
-						if cleaned != "" && !looksLikeJSONFragment(cleaned) {
-							if pendingOutput == "" {
-								pendingOutput = cleaned
-							} else {
-								pendingOutput += "\n" + cleaned
-							}
-							if len(pendingOutput) > maxPendingSize {
-								// Force flush to prevent unbounded growth
-								if pendingOutput != lastSentContent {
-									log.Printf("[watcher] force flush %d chars (cap) for session %s", len(pendingOutput), session.Name)
-									lastSentContent = pendingOutput
-									sm.sendTextWithContext(channelName, chatID, contextToken, pendingOutput)
-								}
-								pendingOutput = ""
-								pendingTimer.Stop()
-							} else {
-								resetTimer(pendingTimer, 1*time.Second)
-							}
-						}
+					if err != nil || len(events) == 0 {
 						continue
 					}
 					for _, event := range events {
@@ -291,18 +276,26 @@ func stripBridgeCommandEcho(s string) string {
 // looksLikeJSONFragment detects partial JSON lines that leaked from stream-json output
 // (e.g. a long JSON line split across terminal screen rows).
 func looksLikeJSONFragment(s string) bool {
-	// Ends with JSON-like suffix but doesn't start with '{'
+	if len(s) == 0 {
+		return false
+	}
+	// Complete JSON objects are handled by the parser, not filtered here
 	if s[0] == '{' {
 		return false
 	}
-	// Fragments typically contain JSON structural chars like ":"
-	if !strings.Contains(s, `":"`) {
-		return false
+	// Fragments with JSON key-value pairs
+	if strings.Contains(s, `":"`) {
+		return true
 	}
-	// Ends with }, or contains session_id/uuid/type patterns typical of stream-json
-	return strings.HasSuffix(s, "}") || strings.HasSuffix(s, `"}`) ||
-		strings.Contains(s, `"session_id"`) || strings.Contains(s, `"uuid"`) ||
-		strings.Contains(s, `"parent_tool_use_id"`)
+	// Fragments ending with JSON closing (e.g. `0bde677531"}`)
+	if strings.HasSuffix(s, `"}`) || strings.HasSuffix(s, `"}`) {
+		return true
+	}
+	// Hex-like content ending with } (UUID fragments from stream-json)
+	if strings.HasSuffix(s, "}") && !strings.Contains(s, " ") {
+		return true
+	}
+	return false
 }
 
 // compressBlankLines collapses 3+ consecutive blank lines into 1, and trims leading/trailing blank lines.
