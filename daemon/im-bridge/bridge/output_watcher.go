@@ -72,51 +72,21 @@ const (
 	maxPendingSize = 64 * 1024 // 64KB cap to prevent unbounded growth
 )
 
-// watchOutput polls a terminal surface for output changes and streams diffs to IM.
-// Implements OpenClaw-style conversational output:
-// - Captures baseline BEFORE command, only sends genuinely NEW content
-// - Debounces rapid changes (waits for output to stabilize)
-// - Strips ANSI codes, cleans up terminal noise
-// - In AI mode, attempts to parse stream-json lines and route them through IMPresenter
+// watchOutput polls a terminal surface for shell command output and streams diffs to IM.
+// Used only for shell mode (!ls, /bash). AI mode uses watchAgentProcess instead.
 func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, session *Session, channelName, chatID, contextToken string) {
-	var presenter *IMPresenter
-	defer func() {
-		session.setRunningTurn(false)
-		if presenter != nil {
-			presenter.Close()
-		}
-	}()
+	defer session.setRunningTurn(false)
 
 	log.Printf("[watcher] starting for session %s (surface %s)", session.Name, session.SurfaceID)
-
-	isAI := session.agentType() != AgentTypeShell
-	bufferedIM := isAI && strings.EqualFold(channelName, "wechat")
-
-	// For AI mode, create a per-turn presenter with a control_request callback.
-	if isAI {
-		presenter = NewIMPresenter(sm.channel, channelName, chatID, contextToken, session.verbose())
-		if bufferedIM {
-			presenter.SetBufferedMode("处理中...", 2*time.Second)
-		}
-		presenter.onControlRequest = func(event StreamEvent) {
-			sm.handleStreamEvent(session, event)
-		}
-	}
 
 	ticker := time.NewTicker(fastInterval)
 	defer ticker.Stop()
 
 	idleCount := 0
 	lastSentContent := ""
-	// Pending output buffer — accumulate changes before sending (shell mode and non-buffered AI only)
 	var pendingOutput string
 	pendingTimer := time.NewTimer(0)
-	<-pendingTimer.C // drain initial fire
-
-	// Track processed JSON lines to prevent duplicate events across polling cycles.
-	// extractNewLines can return the same lines when the terminal scrolls.
-	processedLines := make(map[string]bool)
-	_ = lastSentContent // used in shell mode only
+	<-pendingTimer.C
 	defer func() {
 		if !pendingTimer.Stop() {
 			select {
@@ -133,7 +103,6 @@ func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, s
 			return
 		case <-ticker.C:
 			if !session.isWatching() {
-				log.Printf("[watcher] stopped for session %s", session.Name)
 				return
 			}
 
@@ -143,10 +112,7 @@ func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, s
 				continue
 			}
 
-			// Normalize for comparison — strip ANSI first to avoid false diffs from cursor/color changes
 			currentCleaned := cleanTerminalOutput(currentOutput)
-
-			// Atomically swap lastOutput to avoid TOCTOU race between read and write
 			previousOutput := session.swapLastOutput(currentOutput)
 			lastCleaned := cleanTerminalOutput(previousOutput)
 
@@ -160,63 +126,36 @@ func (sm *SessionManager) watchOutput(ctx context.Context, workspaceID string, s
 				continue
 			}
 
-			// Genuine new content detected
 			diff := extractNewLines(lastCleaned, currentCleaned)
 			idleCount = 0
 			ticker.Reset(fastInterval)
 
-			if isAI && presenter != nil {
-				// AI mode: only use stream-json events via presenter.
-				// Never fall back to plain-text — terminal screen content is unreliable
-				// (wrapped lines, scrolling, duplicates) and causes repeated/garbled output.
-				for _, line := range strings.Split(diff, "\n") {
-					trimmed := strings.TrimSpace(line)
-					if trimmed == "" || processedLines[trimmed] {
-						continue
-					}
-					events, err := ParseLineForProvider(session.agentType(), trimmed)
-					if err != nil || len(events) == 0 {
-						continue
-					}
-					processedLines[trimmed] = true
-					for _, event := range events {
-						presenter.HandleEvent(event)
-						sm.handleStreamEvent(session, event)
-					}
-				}
+			cleaned := strings.TrimSpace(diff)
+			if cleaned == "" {
+				continue
+			}
+			if pendingOutput == "" {
+				pendingOutput = cleaned
 			} else {
-				// Shell mode: plain-text accumulation path
-				cleaned := strings.TrimSpace(diff)
-				if cleaned == "" {
-					continue
+				pendingOutput += "\n" + cleaned
+			}
+			if len(pendingOutput) > maxPendingSize {
+				if pendingOutput != lastSentContent {
+					lastSentContent = pendingOutput
+					sm.sendTextWithContext(channelName, chatID, contextToken, pendingOutput)
 				}
-				if pendingOutput == "" {
-					pendingOutput = cleaned
-				} else {
-					pendingOutput += "\n" + cleaned
-				}
-				if len(pendingOutput) > maxPendingSize {
-					// Force flush to prevent unbounded growth
-					if pendingOutput != lastSentContent {
-						log.Printf("[watcher] force flush %d chars (cap) for session %s", len(pendingOutput), session.Name)
-						lastSentContent = pendingOutput
-						sm.sendTextWithContext(channelName, chatID, contextToken, pendingOutput)
-					}
-					pendingOutput = ""
-					pendingTimer.Stop()
-				} else {
-					resetTimer(pendingTimer, 1*time.Second)
-				}
+				pendingOutput = ""
+				pendingTimer.Stop()
+			} else {
+				resetTimer(pendingTimer, 1*time.Second)
 			}
 
 		case <-pendingTimer.C:
 			if pendingOutput == "" || pendingOutput == lastSentContent {
 				continue
 			}
-
 			log.Printf("[watcher] sending %d chars for session %s", len(pendingOutput), session.Name)
 			lastSentContent = pendingOutput
-
 			sm.sendTextWithContext(channelName, chatID, contextToken, pendingOutput)
 			pendingOutput = ""
 		}
@@ -334,30 +273,6 @@ func stripBridgeCommandEcho(s string) string {
 	return strings.Join(result, "\n")
 }
 
-// looksLikeJSONFragment detects partial JSON lines that leaked from stream-json output
-// (e.g. a long JSON line split across terminal screen rows).
-func looksLikeJSONFragment(s string) bool {
-	if len(s) == 0 {
-		return false
-	}
-	// Complete JSON objects are handled by the parser, not filtered here
-	if s[0] == '{' {
-		return false
-	}
-	// Fragments with JSON key-value pairs
-	if strings.Contains(s, `":"`) {
-		return true
-	}
-	// Fragments ending with JSON closing (e.g. `0bde677531"}`)
-	if strings.HasSuffix(s, `"}`) || strings.HasSuffix(s, `"}`) {
-		return true
-	}
-	// Hex-like content ending with } (UUID fragments from stream-json)
-	if strings.HasSuffix(s, "}") && !strings.Contains(s, " ") {
-		return true
-	}
-	return false
-}
 
 // compressBlankLines collapses 3+ consecutive blank lines into 1, and trims leading/trailing blank lines.
 func compressBlankLines(s string) string {
