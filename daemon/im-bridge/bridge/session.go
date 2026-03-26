@@ -78,6 +78,7 @@ type Session struct {
 
 	watchCancel context.CancelFunc
 	runningTurn bool
+	agentProc   *AgentProcess
 	streamMu    sync.Mutex
 	mu          sync.RWMutex
 }
@@ -1133,35 +1134,25 @@ func (sm *SessionManager) handleContextCommand(agent *Agent, msg channels.Inboun
 }
 
 func (sm *SessionManager) handleAIInput(agent *Agent, session *Session, msg channels.InboundMessage, prompt string) {
-	if session.SurfaceType != "" && session.SurfaceType != "terminal" {
-		sm.reply(msg, "The active session is not a terminal. Switch to a terminal session before sending AI prompts.")
+	// Use subprocess pipe for AI mode: launch agent directly, read stdout
+	session.stopWatching()
+
+	proc, err := LaunchAgentProcess(session, prompt, sm.aiCfg, sm.mediaDir)
+	if err != nil {
+		sm.reply(msg, "Error launching agent: "+err.Error())
 		return
 	}
-
-	// Same as handleBash: send text to terminal and watch output
-	session.stopWatching()
-	baseline, _ := sm.cmux.ReadText(agent.workspaceID(), session.SurfaceID)
-	session.setLastOutput(baseline)
 
 	ctx, cancel := context.WithCancel(sm.ctx)
 	session.setWatchCancel(cancel)
 	session.setRunningTurn(true)
-	go sm.watchOutput(ctx, agent.workspaceID(), session, msg.ChannelName, msg.ChatID, msg.ContextToken)
 
-	command, err := PrepareTurnCommand(session, prompt, sm.aiCfg, sm.mediaDir)
-	if err != nil {
-		session.stopWatching()
-		session.setRunningTurn(false)
-		sm.reply(msg, "Error preparing agent command: "+err.Error())
-		return
-	}
+	// Store process for /stop command
+	session.mu.Lock()
+	session.agentProc = proc
+	session.mu.Unlock()
 
-	if err := sm.cmux.SendText(agent.workspaceID(), session.SurfaceID, command); err != nil {
-		session.stopWatching()
-		session.setRunningTurn(false)
-		sm.reply(msg, "Error sending to terminal: "+err.Error())
-		return
-	}
+	go sm.watchAgentProcess(ctx, proc, session, msg.ChannelName, msg.ChatID, msg.ContextToken)
 	sm.persistSessionState(agent, session)
 }
 
@@ -2008,9 +1999,15 @@ func (s *Session) stopWatching() {
 	s.mu.Lock()
 	cancel := s.watchCancel
 	s.watchCancel = nil
+	proc := s.agentProc
+	s.agentProc = nil
 	s.mu.Unlock()
 	if cancel != nil {
 		cancel()
+	}
+	// Kill agent subprocess if running
+	if proc != nil && proc.Cmd != nil && proc.Cmd.Process != nil {
+		proc.Cmd.Process.Kill()
 	}
 }
 

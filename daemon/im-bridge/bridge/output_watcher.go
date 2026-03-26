@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"bufio"
 	"context"
 	"log"
 	"regexp"
@@ -9,6 +10,60 @@ import (
 	"unicode"
 	"unicode/utf8"
 )
+
+// watchAgentProcess reads stream-json lines directly from the agent subprocess stdout.
+// This replaces terminal screen polling for AI mode, providing zero-latency structured output.
+func (sm *SessionManager) watchAgentProcess(ctx context.Context, proc *AgentProcess, session *Session, channelName, chatID, contextToken string) {
+	var presenter *IMPresenter
+	defer func() {
+		session.setRunningTurn(false)
+		if presenter != nil {
+			presenter.Close()
+		}
+	}()
+
+	isAI := session.agentType() != AgentTypeShell
+	if isAI {
+		presenter = NewIMPresenter(sm.channel, channelName, chatID, contextToken, session.verbose())
+		if channelName == "wechat" {
+			presenter.SetBufferedMode("处理中...", 2*time.Second)
+		}
+	}
+
+	scanner := bufio.NewScanner(proc.Stdout)
+	// Allow large lines (stream-json init events can be 100KB+)
+	scanner.Buffer(make([]byte, 0, 256*1024), 256*1024)
+
+	for scanner.Scan() {
+		select {
+		case <-ctx.Done():
+			log.Printf("[agent-watcher] context cancelled for session %s", session.Name)
+			// Kill the subprocess
+			if proc.Cmd.Process != nil {
+				proc.Cmd.Process.Kill()
+			}
+			return
+		default:
+		}
+
+		line := scanner.Text()
+		if presenter != nil {
+			events, err := ParseLineForProvider(session.agentType(), line)
+			if err != nil || len(events) == 0 {
+				continue
+			}
+			for _, event := range events {
+				presenter.HandleEvent(event)
+				sm.handleStreamEvent(session, event)
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		log.Printf("[agent-watcher] scanner error for session %s: %v", session.Name, err)
+	}
+	log.Printf("[agent-watcher] process finished for session %s", session.Name)
+}
 
 const (
 	fastInterval   = 200 * time.Millisecond
