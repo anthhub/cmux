@@ -9436,6 +9436,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             return false
         }
 
+        // When a browser text input (address bar or in-page <input>/<textarea>/
+        // contentEditable) has focus, let Cmd+Shift+Arrow through for text
+        // selection (select-to-beginning/end-of-line) instead of consuming it
+        // for surface switching.
+        if focusedBrowserAddressBarPanelIdForShortcutEvent(event) != nil
+            || browserWebViewIsFirstResponderForShortcutEvent(event) {
+            let arrowNormalizedFlags = flags.subtracting([.numericPad, .function, .capsLock])
+            let isHorizontalArrow = event.keyCode == 123 || event.keyCode == 124
+            if isHorizontalArrow && arrowNormalizedFlags == [.command, .shift] {
+                return false
+            }
+        }
+
         // Primary UI shortcuts
         if matchShortcut(event: event, shortcut: KeyboardShortcutSettings.shortcut(for: .toggleSidebar)) {
             _ = toggleSidebarInActiveMainWindow()
@@ -9536,6 +9549,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             return true
         }
 
+        // Surface navigation (arrow-key alternatives): Cmd+Shift+→ / Cmd+Shift+←
+        if matchArrowShortcut(
+            event: event,
+            shortcut: StoredShortcut(key: "→", command: true, shift: true, option: false, control: false),
+            keyCode: 124
+        ) {
+            tabManager?.selectNextSurface()
+            return true
+        }
+        if matchArrowShortcut(
+            event: event,
+            shortcut: StoredShortcut(key: "←", command: true, shift: true, option: false, control: false),
+            keyCode: 123
+        ) {
+            tabManager?.selectPreviousSurface()
+            return true
+        }
+
         if matchShortcut(event: event, shortcut: KeyboardShortcutSettings.shortcut(for: .toggleTerminalCopyMode)) {
             let handled = tabManager?.toggleFocusedTerminalCopyMode() ?? false
 #if DEBUG
@@ -9568,6 +9599,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 "ws.shortcut dir=prev repeat=\(event.isARepeat ? 1 : 0) keyCode=\(event.keyCode) selected=\(selected)"
             )
 #endif
+            tabManager?.selectPreviousTab()
+            return true
+        }
+
+        // Workspace navigation (arrow-key alternatives): Cmd+Ctrl+→ / Cmd+Ctrl+←
+        if matchArrowShortcut(
+            event: event,
+            shortcut: StoredShortcut(key: "→", command: true, shift: false, option: false, control: true),
+            keyCode: 124
+        ) {
+            tabManager?.selectNextTab()
+            return true
+        }
+        if matchArrowShortcut(
+            event: event,
+            shortcut: StoredShortcut(key: "←", command: true, shift: false, option: false, control: true),
+            keyCode: 123
+        ) {
             tabManager?.selectPreviousTab()
             return true
         }
@@ -10161,6 +10210,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         )
 #endif
         return panelId
+    }
+
+    /// Returns true when the first responder for the shortcut event's window
+    /// is a `CmuxWebView` or one of its WebKit-internal subviews (i.e., web
+    /// page content has keyboard focus). This is a lightweight AppKit responder
+    /// chain walk — no JavaScript execution — so it is safe on the typing hot
+    /// path.
+    private func browserWebViewIsFirstResponderForShortcutEvent(_ event: NSEvent) -> Bool {
+        let window = event.window ?? NSApp.keyWindow
+        guard let firstResponder = window?.firstResponder else { return false }
+
+        // Walk the responder chain looking for CmuxWebView.
+        if firstResponder is CmuxWebView { return true }
+        var current: NSResponder? = firstResponder
+        while let next = current?.nextResponder {
+            if next is CmuxWebView { return true }
+            current = next
+        }
+
+        return false
     }
 
     @discardableResult
@@ -10901,9 +10970,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     /// Match arrow key shortcuts using keyCode
     /// Arrow keys include .numericPad and .function in their modifierFlags, so strip those before comparing.
+    /// Also strip .capsLock to match matchShortcut behavior so CapsLock-on does not silently break these shortcuts.
     private func matchArrowShortcut(event: NSEvent, shortcut: StoredShortcut, keyCode: UInt16) -> Bool {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            .subtracting([.numericPad, .function])
+            .subtracting([.numericPad, .function, .capsLock])
         return event.keyCode == keyCode && flags == shortcut.modifierFlags
     }
 
